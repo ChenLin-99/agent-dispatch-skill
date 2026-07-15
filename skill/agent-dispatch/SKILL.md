@@ -10,11 +10,12 @@ Coordinate one top-level orchestrator and one called agent without losing sessio
 ## Start safely
 
 1. Read the target repository's `AGENTS.md`, `PROTOCOL.md`, `TOOLING.md`, and relevant logs when present. Treat files and Git state as current truth.
-2. Run `python3 scripts/agent_dispatch.py doctor --worktree <repo>` from this skill directory.
-3. Stop if `AGENT_CALL_DEPTH=1`. A called agent must never call another agent or dispatcher.
-4. Keep exactly one top-level orchestrator. Finish or cancel the current invocation before transferring ownership.
-5. Ask the user to confirm the target App is idle before any compatible shared call. Never infer App idleness from dispatcher locks.
-6. Run every dispatcher invocation in the foreground. In a one-shot agent CLI, a background Bash job is killed when the parent exits; set the caller tool timeout above the envelope budget and let dispatcher perform its own orderly timeout.
+2. Run `python3 scripts/agent_dispatch.py selftest` from this skill directory. It uses a temporary Git repository and a local stub, so it needs no model quota, network, authentication, or App-idle confirmation.
+3. Run `python3 scripts/agent_dispatch.py doctor --worktree <repo>`.
+4. Stop if `AGENT_CALL_DEPTH=1`. A called agent must never call another agent or dispatcher; the fixed local `selftest` is the only non-business exception.
+5. Keep exactly one top-level orchestrator. Finish or cancel the current invocation before transferring ownership.
+6. Ask the user to confirm the target App is idle before any compatible shared call. Never infer App idleness from dispatcher locks.
+7. Prefer foreground execution as the portable default. Never assume plain `&` is durable. Use background execution only when the launcher documents durable jobs or a harmless survival probe has passed; then retain the PID, stdout/stderr and result paths, monitor `status`, and do not transfer orchestration or claim success before a terminal result.
 
 `doctor` reports the Git common directory and the parent-runtime requirements it cannot prove. Before a real call, the top-level agent itself must be able to write dispatcher state under that Git common directory, and the nested target CLI must be able to read its normal authentication. Treat these as launcher prerequisites, not permissions the skill may bypass. Never disable a sandbox for an untrusted repository.
 
@@ -55,7 +56,7 @@ Run preflight and the real invocation through the wrapper:
 python3 scripts/agent_dispatch.py run /tmp/task.json --queue --live-text
 ```
 
-Keep that command in the foreground. Do not append `&`, use a background-task tool, or let the parent one-shot CLI exit while dispatcher is running. The outer tool timeout must exceed the envelope timeout; shortening the envelope budget is preferable when the outer tool has a hard maximum.
+Keep that command in the foreground by default, with the outer timeout above the envelope budget. A verified durable launcher may detach it under the evidence and monitoring rules above. Read [references/install-and-share.md](references/install-and-share.md) for the harmless survival probe; never generalize one harness result to another.
 
 When a result can only be seen in a dedicated session, complete AT-76-style handback automatically after a fresh human idle confirmation:
 

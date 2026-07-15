@@ -6,6 +6,7 @@
     dispatch-agent --validate-only <envelope.json>
     dispatch-agent --preflight <envelope.json>
     dispatch-agent --status <worktree>
+    dispatch-agent --selftest
     dispatch-agent --force-release <worktree> <确认值> <reason...>
       [--override-live-child-pid=<pid>]
         # 人工清理租约/隔离区/残留会话锁,留审计;确认值须匹配当前租约或
@@ -38,7 +39,8 @@ v4.5 双向可见队列与 shared-first(AT-35/36):
 - 每次调用在 Git common-dir 下登记双向队列票据;`--queue` 或
   `queue.on_conflict=wait` 使资源忙时等待,否则保留快速拒绝兼容语义;
 - `--status <worktree>` 统一显示 active/recent/orphaned 队列、写租约、会话锁
-  与隔离状态;它是 depth=1 唯一可用的只读子命令,不能发起调用;
+  与隔离状态;它可在 depth=1 只读查询,不能发起调用;固定本地桩的
+  `--selftest` 是另一个非业务例外,不接受目标或信封参数;
 - `session=auto + shared_app_idle_confirmed=true` 在 shared 已登记且模式兼容时
   优先续接用户 App 主会话;
 - dispatcher 仍无法看到 App 原生队列或自由输入,不伪造忙闲检测。
@@ -107,6 +109,7 @@ from __future__ import annotations
 import datetime
 import errno
 import hashlib
+import io
 import json
 import os
 import posixpath
@@ -114,9 +117,11 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
+from contextlib import redirect_stdout
 from pathlib import Path
 
 try:  # POSIX 独占锁:进程死亡(含 SIGKILL)时由 OS 释放,是判定 orphan 的硬证据
@@ -3251,14 +3256,193 @@ def print_status(worktree: Path) -> int:
     return 0
 
 
+def run_selftest() -> int:
+    """零成本走通真实调度主链;目标固定为临时 Git 仓中的本地桩。
+
+    这是 depth=1 的窄例外:不接受信封/路径/target 参数,不读取认证,不调用真实
+    Claude/Codex。正向路径验证提交与收尾,负向路径验证 dirty clean gate 在桩启动前
+    关闭式拒绝。后者让 selftest 能被真实闸门变异证伪,而非只自证输出格式。
+    """
+    checks: dict[str, bool] = {}
+    diagnostics: dict[str, object] = {}
+    try:
+        with tempfile.TemporaryDirectory(prefix="agent-dispatch-selftest-") as raw_root:
+            root = Path(raw_root)
+            repo = root / "repo"
+            bindir = root / "bin"
+            repo.mkdir()
+            bindir.mkdir()
+            marker = root / "stub-invocations.txt"
+
+            def git_checked(*args: str) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args], text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+            git_checked("add", "seed.txt")
+            git_checked("-c", "user.name=Agent Dispatch Selftest", "-c",
+                        "user.email=selftest@example.invalid", "commit", "-qm", "init")
+            base_commit = git_checked("rev-parse", "HEAD").stdout.strip()
+
+            stub = bindir / "claude"
+            stub.write_text(
+                "#!/bin/sh\n"
+                "set -eu\n"
+                "PROMPT=$(cat)\n"
+                "case \"$PROMPT\" in *SELFTEST_PROMPT_TOKEN*) ;; *) exit 9 ;; esac\n"
+                "printf 'invoked\\n' >> \"$AGENT_DISPATCH_SELFTEST_MARKER\"\n"
+                "printf 'selftest\\n' > selftest-proof.txt\n"
+                "git add selftest-proof.txt\n"
+                "git -c user.name='Agent Dispatch Selftest' "
+                "-c user.email=selftest@example.invalid commit -qm 'selftest write'\n"
+                "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\","
+                "\"session_id\":\"SELFTEST-SESSION-0001\","
+                "\"model\":\"claude-opus-selftest\",\"fast_mode_state\":\"off\"}'\n"
+                "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\","
+                "\"session_id\":\"SELFTEST-SESSION-0001\","
+                "\"result\":\"SELFTEST_TARGET_OK\","
+                "\"terminal_reason\":\"completed\",\"total_cost_usd\":0}'\n",
+                encoding="utf-8")
+            stub.chmod(0o755)
+
+            def write_envelope(path: Path, task_id: str, head: str) -> None:
+                path.write_text(json.dumps({
+                    "task_id": task_id,
+                    "caller": "dispatcher",
+                    "target": "claude",
+                    "role": "implementer",
+                    "mode": "write",
+                    "worktree": str(repo),
+                    "base_commit": head,
+                    "allowed_paths": ["selftest-proof.txt"],
+                    "session": "fresh",
+                    "workflow": {"id": "selftest", "phase": "implement", "iteration": 1},
+                    "routing": {"profile": "simple"},
+                    "queue": {"on_conflict": "wait", "timeout_s": 10, "poll_ms": 50},
+                    "budget": {"timeout_s": 30, "max_turns": 10},
+                    "prompt": "SELFTEST_PROMPT_TOKEN: perform the fixed local stub write",
+                }, ensure_ascii=False), encoding="utf-8")
+
+            positive_path = root / "positive.json"
+            write_envelope(positive_path, "selftest-positive", base_commit)
+            saved_env = {name: os.environ.get(name) for name in
+                         ("PATH", "AGENT_CALL_DEPTH", "AGENT_DISPATCH_SELFTEST_MARKER")}
+            global REPO_MARKER
+            saved_repo_marker = REPO_MARKER
+            try:
+                os.environ["PATH"] = f"{bindir}{os.pathsep}{saved_env['PATH'] or ''}"
+                os.environ["AGENT_DISPATCH_SELFTEST_MARKER"] = str(marker)
+                os.environ.pop("AGENT_CALL_DEPTH", None)
+                REPO_MARKER = ""
+
+                positive_stdout = io.StringIO()
+                with redirect_stdout(positive_stdout):
+                    positive_code = run(str(positive_path), queue_on_conflict=True)
+                positive = json.loads(positive_stdout.getvalue())
+
+                def marker_lines() -> list[str]:
+                    try:
+                        return marker.read_text(encoding="utf-8").splitlines()
+                    except FileNotFoundError:
+                        return []
+
+                head_after = git_checked("rev-parse", "HEAD").stdout.strip()
+                clean_after = not git_checked("status", "--porcelain").stdout.strip()
+                result_path = Path(positive.get("events_path", "")) / "result-envelope.json"
+                persisted = json.loads(result_path.read_text(encoding="utf-8")) \
+                    if result_path.is_file() else None
+                runtime = shared_runtime(repo, create=False)
+                queue_snapshot = DispatchQueue(runtime, create=False).snapshot() if runtime else {}
+                lease = Lease(runtime).read() if runtime else {"missing": True}
+                quarantine = Quarantine(runtime).read() if runtime else {"missing": True}
+                conversations = ConversationLease(runtime, create=False).records() \
+                    if runtime else [("missing", {})]
+
+                checks.update({
+                    "positive_exit_zero": positive_code == 0,
+                    "positive_status_ok": positive.get("status") == "ok",
+                    "target_stub_used_once": marker_lines() == ["invoked"],
+                    "head_advanced": head_after != base_commit,
+                    "worktree_clean": clean_after,
+                    "changed_paths_audited": positive.get("changed_paths")
+                                             == ["selftest-proof.txt"],
+                    "no_path_violations": positive.get("path_violations") == [],
+                    "session_captured": positive.get("session_id") == "SELFTEST-SESSION-0001",
+                    "result_persisted_from_stdout": persisted == positive,
+                    "queue_has_no_active_or_orphaned":
+                        queue_snapshot.get("active") == [] and
+                        queue_snapshot.get("orphaned") == [],
+                    "leases_and_quarantine_cleared":
+                        lease is None and quarantine is None and conversations == [],
+                })
+
+                # 负向证伪面:破坏 clean gate 后这次会启动桩,令 selftest 变红。
+                (repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+                negative_path = root / "negative.json"
+                write_envelope(negative_path, "selftest-dirty-gate", head_after)
+                negative_stdout = io.StringIO()
+                with redirect_stdout(negative_stdout):
+                    negative_code = run(str(negative_path), queue_on_conflict=True)
+                negative = json.loads(negative_stdout.getvalue())
+                checks.update({
+                    "dirty_gate_nonzero": negative_code != 0,
+                    "dirty_gate_rejected_before_target":
+                        negative.get("status") == "rejected_worktree" and
+                        marker_lines() == ["invoked"],
+                })
+                diagnostics.update({
+                    "positive_exit": positive_code,
+                    "positive_status": positive.get("status"),
+                    "positive_errors": positive.get("errors", []),
+                    "stub_invocations": len(marker_lines()),
+                    "negative_exit": negative_code,
+                    "negative_status": negative.get("status"),
+                    "model_calls": 0,
+                    "network_required": False,
+                })
+            finally:
+                REPO_MARKER = saved_repo_marker
+                for name, value in saved_env.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+    except Exception as exc:  # noqa: BLE001 - selftest 必须结构化报告自身故障
+        print(json.dumps({
+            "status": "failed",
+            "checks": checks,
+            "errors": [f"{type(exc).__name__}: {exc}"],
+            "diagnostics": diagnostics,
+        }, ensure_ascii=False, indent=2))
+        return 1
+
+    failed = [name for name, passed in checks.items() if not passed]
+    print(json.dumps({
+        "status": "ok" if not failed else "failed",
+        "checks": checks,
+        "errors": [f"check failed: {name}" for name in failed],
+        "diagnostics": diagnostics,
+        "scope": "temporary Git repository plus fixed local Claude stub; no real agent or network",
+    }, ensure_ascii=False, indent=2))
+    return 0 if not failed else 1
+
+
 def main() -> int:
-    # AT-35:状态查询是唯一的 depth=1 例外;它不执行/修改/解锁任务。
+    # AT-35:status 是只读 depth=1 例外。发布 selftest 也是窄例外,但它只在
+    # 临时 Git 仓里运行固定本地桩,不接受业务参数、不调用真实 agent/网络。
     args = sys.argv[1:]
     if args and args[0] == "--status":
         if len(args) != 2:
             print("用法:--status <worktree>", file=sys.stderr)
             return 2
         return print_status(Path(args[1]))
+    if args and args[0] == "--selftest":
+        if len(args) != 1:
+            print("用法:--selftest", file=sys.stderr)
+            return 2
+        return run_selftest()
     # XB-47:depth guard 覆盖其他所有执行/管理子命令,尤其是 --force-release。
     if int(os.environ.get("AGENT_CALL_DEPTH", "0")) >= 1:
         print(json.dumps({"status": "rejected_depth",

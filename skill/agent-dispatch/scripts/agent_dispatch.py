@@ -275,6 +275,9 @@ def main() -> int:
     doctor = subparsers.add_parser("doctor")
     doctor.add_argument("--worktree", type=Path, required=True)
 
+    subparsers.add_parser(
+        "selftest", help="Run a zero-cost dispatcher test with a temporary Git repo and stub CLI")
+
     status = subparsers.add_parser("status")
     status.add_argument("worktree", type=Path)
 
@@ -302,6 +305,14 @@ def main() -> int:
         return execute_make_envelope(args)
     if args.command == "run":
         return execute_run(args)
+    if args.command == "selftest":
+        code, stdout, stderr = call_dispatcher(["--selftest"])
+        if stderr:
+            print(stderr, file=sys.stderr, end="")
+        # Fail closed if a corrupted dispatcher stops honoring the JSON contract.
+        parse_json(stdout, "selftest")
+        print(stdout, end="")
+        return code
     if args.command == "doctor":
         worktree = args.worktree.expanduser().resolve()
         dispatcher = locate_dispatcher()

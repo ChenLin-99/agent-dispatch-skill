@@ -2,7 +2,7 @@
 
 Install one skill that lets **Codex and Claude coordinate through audited task envelopes** instead of asking you to copy prompts between them.
 
-The package includes only the skill and its required dispatcher.
+This is a minimal installation repository. It contains only the skill, its required dispatcher, and issue-reporting metadata—no development logs or project ledger.
 
 ## Requirements
 
@@ -42,18 +42,28 @@ python3 skill/agent-dispatch/scripts/install_skill.py --project /absolute/path/t
 
 The project receives links under `.agents/skills/` and `.claude/skills/`. The installer refuses to overwrite unrelated files or symlinks.
 
-## Check the installation
+## Zero-cost selftest
 
-From the installed skill directory:
+From the installed skill directory, run:
+
+```bash
+python3 scripts/agent_dispatch.py selftest
+```
+
+The selftest uses a temporary Git repository and fixed local stub. It needs no network, authentication, model quota, or App-idle confirmation. Require exit code 0, top-level `status: ok`, and every reported check to be true.
+
+Then inspect a real target repository without launching another agent:
 
 ```bash
 python3 scripts/agent_dispatch.py doctor --worktree /absolute/path/to/project
 ```
 
-Then invoke it explicitly for the first run:
+Invoke the skill explicitly for the first real run:
 
 - Codex: `$agent-dispatch coordinate this task with Claude`
 - Claude Code: `/agent-dispatch ask Codex to review this change`
+
+Foreground execution is the portable default. Do not assume plain `&` is durable. Use background execution only when the exact launcher documents durable jobs or passes the harmless survival probe in [`install-and-share.md`](skill/agent-dispatch/references/install-and-share.md), and monitor it through a terminal result.
 
 The skill prefers compatible registered shared sessions, requires explicit confirmation that the target App is idle, preserves the one-hop guard, and records Git/session/result evidence. It does not silently bypass dispatcher after a failure.
 
@@ -73,4 +83,4 @@ No open-source license has been selected yet. Public availability does not by it
 
 ## 中文
 
-这是一个只用于安装的最小分发仓库，包含 `agent-dispatch` skill 和它必需的 dispatcher。安装后，Codex 与 Claude 可以通过受审计信封互相委派实现、复审和修订任务，不需要用户手工复制提示词。
+这是一个只用于安装的最小分发仓库，只包含 `agent-dispatch` skill、必需的 dispatcher 和 issue 模板，不包含开发日志与项目台账。安装后，Codex 与 Claude 可以通过受审计信封互相委派实现、复审和修订任务，不需要用户手工复制提示词。

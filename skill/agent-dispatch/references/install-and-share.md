@@ -6,6 +6,8 @@
 - Project installation
 - User installation
 - GitHub sharing
+- Zero-cost selftest
+- Launcher durability probe
 - Fresh-agent test setup
 
 ## Repository layout
@@ -13,16 +15,16 @@
 Keep the source tree intact:
 
 ```text
-agent-dispatch-skill/
+agent-dispatch/
+├── bin/dispatch-agent
 └── skill/agent-dispatch/
     ├── SKILL.md
     ├── agents/openai.yaml
-    ├── bin/dispatch-agent
     ├── scripts/
     └── references/
 ```
 
-The helper locates the dispatcher bundled inside the skill. Both symlink and standard GitHub skill installations therefore preserve zero-configuration discovery. `AGENT_DISPATCH_BIN` remains available only as an explicit development override.
+The helper locates `bin/dispatch-agent` by walking upward from the resolved skill source. Symlink installation therefore preserves zero-configuration discovery. A copied skill needs `AGENT_DISPATCH_BIN=/absolute/path/to/bin/dispatch-agent` or a dispatcher on `PATH`.
 
 ## Project installation
 
@@ -63,6 +65,35 @@ For project-only use, replace `--user` with `--project /path/to/project`.
 
 Direct GitHub clone is appropriate for source distribution and development. For polished one-click distribution to a wider ChatGPT/Codex workspace, package the skill and dispatcher as a plugin later; official Codex guidance recommends plugins for reusable distribution beyond one repository.
 
+## Zero-cost selftest
+
+From the installed skill directory, run:
+
+```bash
+python3 scripts/agent_dispatch.py selftest
+```
+
+The command creates a temporary Git repository and a fixed local Claude stub. It exercises a successful write, commit and path audit, result persistence, queue and lease cleanup, then proves the dirty-worktree gate rejects a second write before the stub starts. It uses no real agent, network, authentication, model quota, or App-idle confirmation. Require exit code 0, top-level `status: ok`, and every reported check to be true.
+
+## Launcher durability probe
+
+Foreground execution is the portable default. Plain `&` is not evidence that a job survives its parent. If a launcher claims durable background jobs, test that exact harness with this harmless two-stage probe before detaching dispatcher:
+
+```bash
+probe_dir=$(mktemp -d)
+nohup sh -c 'sleep 3; printf survived > "$1/done"' sh "$probe_dir" \
+  >"$probe_dir/stdout.log" 2>"$probe_dir/stderr.log" </dev/null &
+printf 'probe_dir=%s pid=%s\n' "$probe_dir" "$!"
+```
+
+Let the launcher turn or parent process exit normally. From a new turn/process after at least three seconds, inspect the printed directory:
+
+```bash
+test "$(cat /path/from/probe_dir/done 2>/dev/null)" = survived
+```
+
+Failure or uncertainty means use foreground execution with an outer timeout above the envelope budget. A passing probe applies only to that launcher and launch form. For a detached dispatcher, retain its PID, stdout/stderr and result paths, monitor `python3 scripts/agent_dispatch.py status <worktree>`, and do not transfer orchestrator ownership or report success until the machine result reaches a terminal state.
+
 ## Fresh-agent test setup
 
 1. Create an empty Git repository with an initial commit.
@@ -71,7 +102,7 @@ Direct GitHub clone is appropriate for source distribution and development. For 
 4. Start a new Codex CLI session and a new Claude Code session from the project root.
 5. Explicitly invoke `$agent-dispatch` or `/agent-dispatch` for the first smoke test.
 6. Run `doctor` from each top-level launcher. Confirm that the launcher can write the reported Git common directory and that a nested target CLI retains its normal authentication. These are real parent-process prerequisites; the skill does not widen its own sandbox or credentials.
-7. Keep dispatcher in the foreground with the outer tool timeout above the envelope budget. A background dispatcher is not durable after a one-shot agent process exits.
+7. Prefer foreground execution with the outer tool timeout above the envelope budget. Detach only after the exact launcher passes the durability probe above, and retain all monitoring evidence.
 8. Keep one orchestrator active at a time. Test Codex→Claude, finish it, then transfer ownership and test Claude→Codex.
 9. Verify Git commits, result envelopes, queue cleanup, and session identity from files rather than agent claims.
 
