@@ -1,0 +1,3512 @@
+#!/usr/bin/env python3
+"""dispatch-agent — 中立跨 agent 调用入口(A″ v4)。
+
+用法:
+    dispatch-agent <envelope.json> [--retry-once] [--live-text] [--queue]
+    dispatch-agent --validate-only <envelope.json>
+    dispatch-agent --preflight <envelope.json>
+    dispatch-agent --status <worktree>
+    dispatch-agent --force-release <worktree> <确认值> <reason...>
+      [--override-live-child-pid=<pid>]
+        # 人工清理租约/隔离区/残留会话锁,留审计;确认值须匹配当前租约或
+        # 隔离记录的 task_id/owner/invocation,防误敲
+
+信任模型(XB-46 裁决,与 Codex 一致):本工具是**防误操作的可信 agent
+调度器**,不是对恶意子进程的 OS 级安全沙箱。.git/hooks、系统调用级
+拦截不在第一阶段范围;main 合并/push 保留为用户人工闸门。
+
+v4.6 外部中断恢复(AT-25):
+- 会话 ID 一旦在事件流出现即原子写回登记表,不等收尾;dispatcher 在收尾前
+  被杀也不会让下一轮 revise 静默退化成 fresh;
+- SIGKILL 不可捕获,残留 lease/会话锁**仍只能人工 --force-release**;本版只保证
+  死进程可被**确定性识别**:队列记录带进程存活锁(OS 在进程死亡时释放),
+  pid 复用不再被误判为存活;--status 列出每个 orphan 持有的租约/会话锁/子 CLI;
+- SIGTERM/SIGHUP 可收敛:终止子 CLI 进程组(宽限后升级 SIGKILL),照常收尾——
+  写任务仍保留租约并隔离,会话锁释放,结果信封落盘;
+- dispatcher 被 SIGKILL 时子 CLI 会继续运行(第二写者),无法阻止,
+  --status/--force-release 如实报告其 pid 与命令,由人工处理;
+- workflow.phase=revise 找不到已登记会话时关闭式拒绝,不静默 fresh
+  (显式 session=fresh 仍可人工放行)。
+
+v4.7 shared-first 是强制策略(AT-77):
+- read_only/verify/implementer write 在 compatible shared 已登记时都续接原 App 会话;
+- auto 缺 App 空闲确认时关闭式失败,不再静默新建 task;显式 task/fresh/project
+  必须给 session_isolation_reason,并在结果 session_decision 留痕;
+- verify/write 的 shared cwd 必须等于审计 worktree,并继续走受保护模式全部闸门。
+
+v4.5 双向可见队列与 shared-first(AT-35/36):
+- 每次调用在 Git common-dir 下登记双向队列票据;`--queue` 或
+  `queue.on_conflict=wait` 使资源忙时等待,否则保留快速拒绝兼容语义;
+- `--status <worktree>` 统一显示 active/recent/orphaned 队列、写租约、会话锁
+  与隔离状态;它是 depth=1 唯一可用的只读子命令,不能发起调用;
+- `session=auto + shared_app_idle_confirmed=true` 在 shared 已登记且模式兼容时
+  优先续接用户 App 主会话;
+- dispatcher 仍无法看到 App 原生队列或自由输入,不伪造忙闲检测。
+
+v4.4 shared + write(AT-26):
+- shared 会话可在 read_only 之外承载 implementer write,但仅当登记 cwd
+  与被审计 worktree 的真实路径完全一致;不一致在子 CLI 启动前关闭式拒绝;
+- shared write 仍取项目级写租约与会话锁,沿用 clean gate、allowed_paths、
+  提交契约和失败隔离;shared_app_idle_confirmed 是 App 空闲的人工闸门并留票据;
+- 用户 App 不读取 dispatcher 锁,仍可能成为第二写者;收尾路径审计能检测
+  越界改动但不能阻止并发,也不能区分落在 allowed_paths 内的改动归属;
+- Codex 的 --skip-git-repo-check 仍只给 shared read_only;shared write 的 cwd
+  已被证明就是 Git worktree,不放宽仓库检查。
+
+v4.3 角色中立工作流:
+- 任务信封可显式声明 role=implementer/reviewer/analyst/recorder 与
+  workflow(id/phase/iteration/review_of),Codex/Claude 均可担任实现或复审;
+- write 实现任务使用专用 task 会话,原调用方在结果返回后复审;
+  CHANGES_REQUESTED 时以同 task_id/iteration+1 恢复实现会话;
+- 结果信封回写 role/workflow,使上层 skill 能驱动一轮或多轮循环,
+  但不放开被调 agent 再调 dispatcher 的一跳边界。
+
+v4 标准化(XB-51~53):
+- Claude 会话记录携带 id/cwd/managed,恢复时从会话所属目录启动,审计仍锁定
+  worktree;dispatcher 创建的专用任务会话不再污染用户活会话;
+- 用户显式选择 session=shared 时恢复原始长期会话,不 fork、不改名、
+  不 fresh 降级;read_only 双向可用,write 仅按 AT-26 的 cwd 绑定窄例外开放;
+- verify 让 reviewer/analyst 在 workspace-write 沙箱中运行测试与临时文件,
+  但用空路径审计和 HEAD 不前进硬断言检测仓库写入;越界沿用隔离失败路径。
+- 模型/effort 由 routing profile 显式路由:默认 Opus/max,Fable 只用于
+  critical/high;请求值与实际模型/速度/用量写入结果信封;
+- Claude 改 stream-json,原始 events.jsonl 与人类可读 transcript.txt 同步
+  落盘;--live-text 可把干净进度实时镜像到终端;
+- 只读 Claude 显式 plan + disallowedTools;恢复不存在时仅 read_only 可
+  降级 fresh 并告警,write 继续关闭式失败。
+
+v3 修正(XB-46/47/48):
+- allowed_paths 以 POSIX 语义规范化后再校验,封堵 `./.git/hooks/` 类绕过;
+- claude 注入 --safe-mode --strict-mcp-config,codex 注入
+  --ignore-user-config --strict-config,隔离 CLI 自定义 hooks/plugins/MCP/用户配置;
+- depth guard 在 main() 覆盖所有执行/管理子命令,子 agent 无法
+  --force-release;AT-35 后只读 --status 是唯一例外;
+- --force-release 需确认值 + 非空原因,同时清理带 owner 信息的残留 sessions.lock;
+- write 任务会话 ID 写回失败 → 状态 ok_no_resume(工作有效但下跳无法 resume)。
+
+v2 相对 v1(a87be0a)的安全修正,对应 Codex 复审 XB-41~46:
+- 租约与会话注册表迁至 `git --git-common-dir` 下的 agent-runtime/,
+  三个 worktree 共享同一份 → 项目级唯一写者(XB-41/44);
+- 租约携带 invocation owner,任何已存在租约一律拒绝(禁止 task_id 重入),
+  release 校验 owner;人工清理只能走 --force-release 并写审计(XB-41);
+- write 前要求干净工作树;paths_violation/timeout/异常/非零退出 →
+  工作树进隔离区且**不释放租约**,直到人工 --force-release(XB-42/45);
+- git 审计命令检查返回码,git 失败 → failed_protocol 而非"无变更"(XB-42);
+- Codex 真实 JSONL(item.completed.item.text)嵌套解析 + `-o` 末消息文件兜底;
+  CLI 退出 0 但拿不到会话 ID → failed_protocol(XB-43);
+- 会话表读改写在文件锁内进行,tmp + os.replace 原子落盘(XB-44);
+- 每次 invocation 独立结果子目录;TimeoutExpired 的 partial 输出落盘(XB-45);
+- 人工闸门:关键词降级为告警;真正边界改为能力硬收窄——claude write 用显式
+  工具白名单(无网络/浏览器工具),codex write 关闭沙箱网络;结果信封中由
+  dispatcher 自报 gate_capability(XB-46)。
+仅用 python3 标准库。
+"""
+
+from __future__ import annotations
+
+import datetime
+import errno
+import hashlib
+import json
+import os
+import posixpath
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from pathlib import Path
+
+try:  # POSIX 独占锁:进程死亡(含 SIGKILL)时由 OS 释放,是判定 orphan 的硬证据
+    import fcntl
+except ImportError:  # pragma: no cover —— 非 POSIX 平台退化为 pid 探测
+    fcntl = None
+
+# 项目护栏:确认 worktree 确实是预期项目,而不是随手指到的别的仓库。
+# 迁出 xds-bridge 后不再硬编码 `collab/`:默认只要求"是 git 工作树"
+# (由 shared_runtime 的 rev-parse 保证),可用环境变量指定更强的标记。
+# 之所以保留这个钩子:XDS 时代它挡住过把信封指错仓库的低级错误。
+REPO_MARKER = os.environ.get("DISPATCH_REPO_MARKER", "")
+BASE_CLAUDE_TOOLS = ["Read", "Grep", "Glob", "LS"]
+READ_ONLY_CLAUDE_TOOLS = BASE_CLAUDE_TOOLS + [
+    "Bash(git log:*)", "Bash(git diff:*)", "Bash(git status:*)", "Bash(git show:*)",
+]
+READ_ONLY_CLAUDE_DENIED_TOOLS = [
+    "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Task",
+    "EnterWorktree", "ExitWorktree", "CronCreate", "CronDelete",
+    "RemoteTrigger", "ScheduleWakeup", "SendMessage",
+]
+VERIFY_CLAUDE_TOOLS = BASE_CLAUDE_TOOLS + ["Bash"]
+VERIFY_CLAUDE_DENIED_TOOLS = READ_ONLY_CLAUDE_DENIED_TOOLS
+WRITE_CLAUDE_TOOLS = BASE_CLAUDE_TOOLS + [
+    "Edit", "Write", "NotebookEdit",
+    # AT-29:实现方必须能运行项目测试。可信-agent模型下开放 Bash,仓库副作用仍由
+    # allowed_paths/提交契约/收尾审计约束;push/merge/network 不再声称被硬阻止。
+    "Bash",
+]
+WRITE_CLAUDE_DENIED_TOOLS = [
+    "WebFetch", "WebSearch", "Task", "EnterWorktree", "ExitWorktree",
+    "CronCreate", "CronDelete", "RemoteTrigger", "ScheduleWakeup",
+    "SendMessage",
+]
+CLAUDE_ROUTING_PROFILES = {
+    "simple": {"model": "opus", "effort": "medium"},
+    "standard": {"model": "opus", "effort": "max"},
+    "critical": {"model": "claude-fable-5", "effort": "high"},
+}
+CLAUDE_EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
+CODEX_ROUTING_PROFILES = {
+    "simple": {"model": "gpt-5.6-terra", "effort": "xhigh"},
+    "standard": {"model": "gpt-5.6-sol", "effort": "high"},
+    "critical": {"model": "gpt-5.6-sol", "effort": "max"},
+}
+CODEX_FALLBACK_MODELS = {
+    "gpt-5.6-sol": {"low", "medium", "high", "xhigh", "max", "ultra"},
+    "gpt-5.6-terra": {"low", "medium", "high", "xhigh", "max", "ultra"},
+    "gpt-5.6-luna": {"low", "medium", "high", "xhigh", "max"},
+    "gpt-5.5": {"low", "medium", "high", "xhigh"},
+    "gpt-5.4": {"low", "medium", "high", "xhigh"},
+    "gpt-5.4-mini": {"low", "medium", "high", "xhigh"},
+    "gpt-5.3-codex-spark": {"low", "medium", "high", "xhigh"},
+    "codex-auto-review": {"low", "medium", "high", "xhigh"},
+}
+CODEX_MODELS_CACHE_ENV = "DISPATCH_CODEX_MODELS_CACHE"
+CODEX_SESSIONS_ROOT_ENV = "DISPATCH_CODEX_SESSIONS_ROOT"
+CLAUDE_PROJECTS_ROOT_ENV = "DISPATCH_CLAUDE_PROJECTS_ROOT"
+RECORDER_PATHS_ENV = "DISPATCH_RECORDER_PATHS"
+DEFAULT_RECORDER_PATHS = ("log", "TOOLING.md")
+CODEX_UNAVAILABLE = "unavailable: codex JSONL 未暴露"
+QUEUE_TERMINAL_RETENTION = 200
+QUEUE_ORPHAN_RETENTION = 200
+THINKING_HEARTBEAT_SECONDS = 15.0
+LIVENESS_SUFFIX = ".alive"
+CHILD_TERM_GRACE_S = 5.0
+CHILD_WAIT_POLL_S = 0.2
+EXIT_REJECTED_QUEUE = 9
+EXIT_QUEUE_TIMEOUT = 10
+EXIT_STALE_QUEUE = 11
+EXIT_MISSING_SESSION = 12
+EXIT_BUDGET_EXHAUSTED = 13
+GATE_WARN_WORDS = ("烧录", "flash the board", "下单", "购买", "merge to main",
+                   "合并主线", "git push", "打印下单")
+TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
+SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+# AT-63:与 observe_codex_rollout 的 session_id 校验同形——登记值会被用于定位
+# 本机会话文件,必须先挡住路径穿越等构造。
+SHARED_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,128}$")
+ROLES = {"implementer", "reviewer", "analyst", "recorder"}
+WORKFLOW_PHASES = {"implement", "review", "revise", "analyze", "record"}
+
+
+# AT-25:本进程持有的队列存活锁(invocation → fd)。fd 由 os.open 创建,PEP 446
+# 起默认不可继承,且 Popen 默认 close_fds=True —— 子 CLI 拿不到这把锁,否则
+# dispatcher 被 SIGKILL 后残留的子进程会让死记录看起来还活着。
+_LIVENESS_FDS: dict[str, int] = {}
+# 当前子 CLI 与外部终止信号;信号处理器只置位与杀子进程组,收敛交给正常收尾路径。
+_ACTIVE_CHILD: dict = {"process": None, "escalate_at": None}
+_TERMINATION: dict = {"signal": None, "at": None, "count": 0}
+
+
+def now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat()
+
+
+def parse_iso_timestamp(value: object) -> datetime.datetime | None:
+    """解析运行时 JSONL 时间戳;无时区值不可用于跨数据源归因。"""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def codex_sessions_root() -> Path:
+    """Codex rollout 根目录;环境变量仅用于可信部署配置与隔离测试。"""
+    override = os.environ.get(CODEX_SESSIONS_ROOT_ENV)
+    return Path(override).expanduser() if override else Path.home() / ".codex" / "sessions"
+
+
+def claude_projects_root() -> Path:
+    """Claude 会话 JSONL 根目录;环境变量用于可信部署配置与隔离测试。"""
+    override = os.environ.get(CLAUDE_PROJECTS_ROOT_ENV)
+    return Path(override).expanduser() if override else Path.home() / ".claude" / "projects"
+
+
+def observe_codex_rollout(session_id: str | None, started_at: str,
+                           observed_at: str | None = None) -> tuple[dict, str | None]:
+    """从用户本地 rollout 读取本次调用真实 model/effort(AT-68)。
+
+    exec JSONL 不提供设置时,dispatcher 以 session_id 定位 Codex rollout,但只接受
+    本 invocation 时间窗内唯一的 ``turn_context``。同一 shared 的并发 App turn 也可能
+    落入该时间窗;零条或多条都无法唯一归因,必须关闭式返回 unavailable 并告警。
+    不会用时间先后、请求值或 shared 会话的旧轮次代替实值。
+    本函数只读既有用户运行时数据,不扩大子进程沙箱或任何写权限。
+    """
+    source = "codex_rollout_turn_context"
+
+    def unavailable(reason: str) -> tuple[dict, str]:
+        return ({"status": "unavailable", "source": source, "reason": reason,
+                 "sessions_root": str(codex_sessions_root())},
+                f"Codex actual_model 不可观测:{reason}")
+
+    if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9-]{8,128}", session_id):
+        return unavailable("缺少安全可归因的 session_id")
+    window_start = parse_iso_timestamp(started_at)
+    window_end = parse_iso_timestamp(observed_at or now_iso())
+    if window_start is None or window_end is None or window_end < window_start:
+        return unavailable("dispatcher 调用时间窗无效")
+
+    root = codex_sessions_root()
+    if not root.is_dir():
+        return unavailable(f"rollout 根目录不存在:{root}")
+    try:
+        candidates = [path for path in root.rglob(f"*{session_id}.jsonl")
+                      if path.is_file() and not path.is_symlink() and
+                      path.name.startswith("rollout-")]
+    except OSError as e:
+        return unavailable(f"rollout 路径扫描失败:{type(e).__name__}: {e}")
+    if len(candidates) != 1:
+        return unavailable(
+            f"rollout 文件无法唯一定位:session_id={session_id}, candidates={len(candidates)}")
+
+    candidate = candidates[0]
+    observations: list[tuple[datetime.datetime, str, str]] = []
+    try:
+        with candidate.open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as e:
+                    return unavailable(
+                        f"rollout JSONL 解析失败:{candidate}:{line_number}: {e.msg}")
+                if not isinstance(event, dict) or event.get("type") != "turn_context":
+                    continue
+                timestamp = parse_iso_timestamp(event.get("timestamp"))
+                payload = event.get("payload")
+                if timestamp is None or not isinstance(payload, dict):
+                    return unavailable(
+                        f"rollout turn_context schema 不完整:{candidate}:{line_number}")
+                if not (window_start <= timestamp <= window_end):
+                    continue
+                model, effort = payload.get("model"), payload.get("effort")
+                if not isinstance(model, str) or not model or not isinstance(effort, str) or not effort:
+                    return unavailable(
+                        f"rollout turn_context 缺少 model/effort:{candidate}:{line_number}")
+                observations.append((timestamp, model, effort))
+    except OSError as e:
+        return unavailable(f"rollout 读取失败:{type(e).__name__}: {e}")
+
+    if not observations:
+        return unavailable("本次 invocation 时间窗内无 turn_context")
+    if len(observations) != 1:
+        return unavailable(
+            f"本次 invocation 时间窗内有多个 turn_context,无法唯一归因:"
+            f"candidates={len(observations)}")
+    timestamp, model, effort = observations[0]
+    return ({
+        "status": "observed",
+        "source": source,
+        "model": model,
+        "effort": effort,
+        "timestamp": timestamp.isoformat(),
+        "path": str(candidate),
+        "attribution": "unique turn_context in same session_id and current dispatcher invocation time window",
+    }, None)
+
+
+def signal_name(signum: int | None) -> str | None:
+    if signum is None:
+        return None
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return f"SIG{signum}"
+
+
+def kill_child_group(process: subprocess.Popen, sig: int) -> None:
+    """终止子 CLI 及其孙进程(AT-25)。
+
+    子进程以 start_new_session=True 启动,自成进程组,因此可以整组终止:
+    只 kill 直接子进程会漏掉它派生的测试/工具进程。防御性检查进程组不等于
+    自己的,避免任何情况下把信号发给 dispatcher 自身。
+    """
+    if process.poll() is not None:
+        return
+    try:
+        pgid = os.getpgid(process.pid)
+    except OSError:
+        pgid = None
+    if pgid is not None and pgid != os.getpgid(0):
+        try:
+            os.killpg(pgid, sig)
+            return
+        except OSError:
+            pass
+    try:
+        process.send_signal(sig)
+    except (OSError, ValueError):
+        pass
+
+
+def _termination_handler(signum, _frame) -> None:
+    """SIGTERM/SIGHUP:不抛异常,置位并终止子 CLI,由主流程走完正常收尾。
+
+    抛异常会在任意位置中断收尾逻辑;置位则让审计、隔离、租约与结果信封
+    照常执行。连按第二次:子 CLI 立即 SIGKILL;若此时已无子进程(收尾阶段
+    卡住),恢复默认处置让操作者的坚持生效,不做不可杀的进程。
+    """
+    _TERMINATION["count"] += 1
+    if _TERMINATION["signal"] is None:
+        _TERMINATION.update(signal=signum, at=now_iso())
+    process = _ACTIVE_CHILD.get("process")
+    alive = process is not None and process.poll() is None
+    if _TERMINATION["count"] >= 2:
+        if alive:
+            kill_child_group(process, signal.SIGKILL)
+            return
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+        return
+    if alive:
+        kill_child_group(process, signal.SIGTERM)
+        _ACTIVE_CHILD["escalate_at"] = time.monotonic() + CHILD_TERM_GRACE_S
+
+
+def install_termination_handlers() -> None:
+    """SIGINT 保持默认(KeyboardInterrupt 可即时中断);SIGTERM/SIGHUP 改为可收敛。"""
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(signum, _termination_handler)
+        except (ValueError, OSError):  # 非主线程或平台不支持:退化为默认处置
+            pass
+
+
+def probe_process(pid: int) -> dict:
+    """尽力探测 pid 是否仍在运行及其命令名(AT-25 的 orphan 子 CLI 诊断)。
+
+    这是给人看的证据,不是安全判定:pid 复用无法从 pid 本身区分,因此附带
+    命令名,让操作者能确认那确实是残留的 claude/codex,而不是无关进程。
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return {"pid": pid, "alive": "unavailable: 记录无有效 pid", "command": "unavailable"}
+    try:
+        os.kill(pid, 0)
+        alive = True
+    except ProcessLookupError:
+        alive = False
+    except PermissionError:
+        alive = True
+    except OSError as exc:
+        return {"pid": pid, "alive": f"unavailable: {type(exc).__name__}",
+                "command": "unavailable"}
+    if not alive:
+        return {"pid": pid, "alive": False, "command": "exited"}
+    command = "unavailable: ps 未返回命令名"
+    try:
+        out = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode == 0 and out.stdout.strip():
+            command = out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return {"pid": pid, "alive": True, "command": command}
+
+
+def git(worktree: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=worktree, capture_output=True, text=True)
+
+
+def git_readonly(worktree: Path, *args: str) -> subprocess.CompletedProcess:
+    """只读检查禁用 Git optional locks,避免 preflight 刷新 index 等隐式写入。"""
+    return subprocess.run(["git", "--no-optional-locks", *args], cwd=worktree,
+                          capture_output=True, text=True)
+
+
+def codex_models_cache_path() -> Path:
+    override = os.environ.get(CODEX_MODELS_CACHE_ENV)
+    if override:
+        return Path(override)
+    return Path.home() / ".codex" / "models_cache.json"
+
+
+def codex_model_catalog() -> tuple[dict[str, set[str]], list[str], str]:
+    """Return Codex models and per-model reasoning efforts.
+
+    The cache is runtime data and can refresh independently of dispatcher
+    releases, so validation must not bake one snapshot into source. If the
+    cache cannot be parsed, fall back to a narrow known-good catalog and warn;
+    never accept arbitrary model names.
+    """
+    path = codex_models_cache_path()
+    warnings: list[str] = []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        models = data.get("models")
+        if not isinstance(models, list):
+            raise ValueError("models 字段缺失或不是列表")
+        catalog: dict[str, set[str]] = {}
+        for model in models:
+            if not isinstance(model, dict) or not isinstance(model.get("slug"), str):
+                continue
+            efforts = set()
+            for level in model.get("supported_reasoning_levels") or []:
+                if isinstance(level, dict) and isinstance(level.get("effort"), str):
+                    efforts.add(level["effort"])
+            if efforts:
+                catalog[model["slug"]] = efforts
+        if not catalog:
+            raise ValueError("未解析到可用 Codex 模型")
+        return catalog, warnings, str(path)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        warnings.append(
+            f"Codex 模型缓存不可用,使用内置最小兜底目录:{path} ({type(exc).__name__}: {exc})"
+        )
+        return {model: set(efforts) for model, efforts in CODEX_FALLBACK_MODELS.items()}, warnings, "fallback"
+
+
+def shared_runtime(worktree: Path, create: bool = True) -> Path | None:
+    """项目级共享 runtime:git common dir 下,跨 worktree 唯一(XB-41/44)。"""
+    out = git(worktree, "rev-parse", "--git-common-dir")
+    if out.returncode != 0:
+        return None
+    common = Path(out.stdout.strip())
+    if not common.is_absolute():
+        common = (worktree / common).resolve()
+    runtime = common / "agent-runtime"
+    if create:
+        runtime.mkdir(parents=True, exist_ok=True)
+    return runtime
+
+
+def git_metadata_roots(worktree: Path) -> list[str]:
+    """AT-19/88:返回 `git add`/`git commit` 必须写入的 git metadata 目录。
+
+    linked worktree 的 `.git` 只是指针文件,真实 index 在
+    `<main>/.git/worktrees/<name>`,objects/refs/logs 在 `<main>/.git`。
+
+    AT-88 更正 AT-19 的一个推断:codex 的 workspace-write 沙箱对 `.git`
+    **另行只读限制,即使它就落在可写根内**。AT-19 只在 linked worktree 上实测过,
+    当时据此推断"主 worktree 的 .git 在根内所以本来就可写"并跳过授权;
+    真实的主仓反向 shared write 证伪了它——Codex 以
+    `Unable to create '.git/index.lock': Operation not permitted` 失败,
+    永远无法履行提交契约。故两种 worktree 都必须显式授权,不按位置推断。
+
+    授予 .git 写权是"agent 自己提交"这一契约的固有代价:Claude 实现方的
+    write 模式也开放通用 Bash,同样能写 .git;此处是对等,不是新增风险面。
+    """
+    roots: list[str] = []
+    if not worktree.is_dir():
+        return roots  # 非真实目录(单测假路径):不注入,保持既有 argv
+    for arg in ("--git-dir", "--git-common-dir"):
+        try:
+            out = git(worktree, "rev-parse", arg)
+        except OSError:
+            continue
+        if out.returncode != 0:
+            continue
+        raw = out.stdout.strip()
+        if not raw:
+            continue
+        path = Path(raw)
+        if not path.is_absolute():
+            path = worktree / path
+        try:
+            path = path.resolve()
+        except OSError:
+            continue
+        # AT-88:不再因为 path 落在 worktree 内就跳过——沙箱不认这个位置推断。
+        # 主 worktree 两个 rev-parse 都指向同一个 .git,由下面的去重收敛。
+        if str(path) not in roots:
+            roots.append(str(path))
+    return roots
+
+
+def validate_envelope(env: dict) -> list[str]:
+    """返回错误列表;空列表 = 合法。纯函数,单测覆盖。"""
+    errs = []
+    task_id = env.get("task_id", "")
+    if not isinstance(task_id, str) or not TASK_ID_RE.match(task_id):
+        errs.append("task_id 必须是 2..64 位小写字母/数字/连字符")
+    if env.get("target") not in ("codex", "claude"):
+        errs.append("target 必须是 codex 或 claude")
+    if env.get("mode") not in ("read_only", "verify", "write"):
+        errs.append("mode 必须是 read_only、verify 或 write")
+    role = env.get("role") or ("implementer" if env.get("mode") == "write" else "analyst")
+    if role not in ROLES:
+        errs.append("role 必须是 implementer/reviewer/analyst/recorder")
+    elif role == "implementer" and env.get("mode") != "write":
+        errs.append("role=implementer 必须使用 mode=write")
+    elif role == "recorder" and env.get("mode") != "write":
+        errs.append("role=recorder 必须使用 mode=write")
+    elif role in ("reviewer", "analyst") and env.get("mode") not in ("read_only", "verify"):
+        errs.append(f"role={role} 必须使用 mode=read_only 或 verify")
+    wt = env.get("worktree", "")
+    if not isinstance(wt, str) or not wt.startswith("/"):
+        errs.append("worktree 必须是绝对路径")
+    base = env.get("base_commit", "")
+    if not isinstance(base, str) or not SHA_RE.match(base):
+        errs.append("base_commit 必须是 7..40 位十六进制提交哈希")
+    if env.get("mode") == "write":
+        ap = env.get("allowed_paths")
+        if not isinstance(ap, list) or not ap or not all(
+            isinstance(p, str) and p.strip() for p in ap
+        ):
+            errs.append("write 模式必须给出非空 allowed_paths 列表")
+        else:
+            for p in ap:
+                norm = normalize_allowed_path(p)
+                if norm is None:
+                    errs.append(f"allowed_paths 项不合法(规范化后须为仓库内相对路径且不指向 .git):{p!r}")
+                elif role == "recorder" and not is_recorder_path(norm):
+                    allowed = ",".join(recorder_paths())
+                    config_warning = "; ".join(recorder_path_warnings())
+                    detail = f"; {config_warning}" if config_warning else ""
+                    errs.append(
+                        f"role=recorder 的 allowed_paths 必须位于配置的文档路径"
+                        f"({allowed})内:{p!r}{detail}")
+    prompt = env.get("prompt", "")
+    if not isinstance(prompt, str) or len(prompt.strip()) < 8:
+        errs.append("prompt 缺失或过短")
+    budget = env.get("budget", {})
+    if not isinstance(budget, dict):
+        errs.append("budget 必须是对象")
+    else:
+        t = budget.get("timeout_s", 900)
+        if not isinstance(t, int) or not 30 <= t <= 3600:
+            errs.append("budget.timeout_s 必须在 30..3600")
+        mt = budget.get("max_turns")
+        if mt is not None and (not isinstance(mt, int) or not 1 <= mt <= 200):
+            errs.append("budget.max_turns 必须在 1..200")
+    workflow = env.get("workflow", {})
+    if not isinstance(workflow, dict):
+        errs.append("workflow 必须是对象")
+    elif workflow:
+        workflow_id = workflow.get("id", "")
+        if not isinstance(workflow_id, str) or not TASK_ID_RE.match(workflow_id):
+            errs.append("workflow.id 必须是 2..64 位小写字母/数字/连字符")
+        phase = workflow.get("phase")
+        if phase not in WORKFLOW_PHASES:
+            errs.append("workflow.phase 必须是 implement/review/revise/analyze/record")
+        iteration = workflow.get("iteration", 1)
+        if not isinstance(iteration, int) or not 1 <= iteration <= 99:
+            errs.append("workflow.iteration 必须在 1..99")
+        expected_role = {
+            "implement": "implementer", "revise": "implementer",
+            "review": "reviewer", "analyze": "analyst",
+            "record": "recorder",
+        }.get(phase)
+        if expected_role and role != expected_role:
+            errs.append(f"workflow.phase={phase} 必须搭配 role={expected_role}")
+        review_of = workflow.get("review_of")
+        if review_of is not None and (not isinstance(review_of, str) or not review_of.strip()):
+            errs.append("workflow.review_of 必须是非空字符串")
+    session_mode = env.get("session", "auto")
+    if session_mode not in ("auto", "project", "task", "fresh", "shared"):
+        errs.append("session 必须是 auto/project/task/fresh/shared")
+    if session_mode == "shared" and env.get("mode") == "write" and role != "implementer":
+        errs.append("session=shared + mode=write 仅允许 role=implementer")
+    isolation_reason = env.get("session_isolation_reason")
+    if isolation_reason is not None:
+        if (not isinstance(isolation_reason, str) or
+                len(isolation_reason.strip()) < 8):
+            errs.append("session_isolation_reason 必须是至少 8 字符的非空理由")
+        if session_mode not in ("task", "fresh", "project"):
+            errs.append("session_isolation_reason 只用于显式 task/fresh/project")
+    if session_mode == "shared" and env.get("shared_app_idle_confirmed") is not True:
+        # AT-22 复审(Codex):conversation_key 只能拒绝 dispatcher 之间的并发恢复,
+        # **管不住用户的 App**——App 不读 Git runtime 锁,仍可能与 CLI 同时向同一
+        # 对话追加消息并交错上下文。此处不伪装成自动保护,改为显式且可审计的人工闸门:
+        # 调用方必须先确认该 App 会话空闲,并把确认写进信封与结果票据。
+        errs.append("session=shared 必须显式声明 shared_app_idle_confirmed=true"
+                    "(调用方须先确认用户 App 未在该会话生成回复;锁管不住 App)")
+    queue = env.get("queue", {})
+    if not isinstance(queue, dict):
+        errs.append("queue 必须是对象")
+    else:
+        if queue.get("on_conflict", "reject") not in ("reject", "wait"):
+            errs.append("queue.on_conflict 必须是 reject 或 wait")
+        queue_timeout = queue.get("timeout_s", 900)
+        if not isinstance(queue_timeout, int) or not 5 <= queue_timeout <= 3600:
+            errs.append("queue.timeout_s 必须在 5..3600")
+        poll_ms = queue.get("poll_ms", 250)
+        if not isinstance(poll_ms, int) or not 50 <= poll_ms <= 5000:
+            errs.append("queue.poll_ms 必须在 50..5000")
+    caller = env.get("caller")
+    if caller is not None and caller not in ("codex", "claude", "user", "dispatcher"):
+        errs.append("caller 必须是 codex/claude/user/dispatcher")
+    routing = env.get("routing", {})
+    if not isinstance(routing, dict):
+        errs.append("routing 必须是对象")
+    else:
+        target = env.get("target")
+        if target not in ("claude", "codex"):
+            return errs
+        codex_catalog = None
+        if target == "codex" or any(
+                isinstance(routing.get("model"), str) and
+                routing["model"].startswith(prefix) for prefix in ("gpt-", "codex-")):
+            codex_catalog, _, _ = codex_model_catalog()
+        profiles = CLAUDE_ROUTING_PROFILES if target == "claude" else CODEX_ROUTING_PROFILES
+        profile = routing.get("profile", "standard")
+        if profile not in profiles:
+            errs.append("routing.profile 必须是 simple/standard/critical")
+            route_model = routing.get("model")
+            route_effort = routing.get("effort")
+        else:
+            route_model = routing.get("model") or profiles[profile]["model"]
+            route_effort = routing.get("effort") or profiles[profile]["effort"]
+        if "model" in routing and (not isinstance(routing["model"], str) or
+                                    not routing["model"].strip()):
+            errs.append("routing.model 必须是非空字符串")
+        elif "model" in routing:
+            model = routing["model"]
+            if target == "codex" and model not in (codex_catalog or {}):
+                errs.append("target=codex 的 routing.model 必须是 Codex CLI 支持的模型")
+            if target == "claude" and (model in (codex_catalog or {}) or
+                                       model.startswith(("gpt-", "codex-"))):
+                errs.append("target=claude 的 routing.model 不能是 Codex 模型")
+        if target == "codex" and isinstance(route_model, str):
+            efforts = (codex_catalog or {}).get(route_model)
+            if not efforts:
+                errs.append("target=codex 的 routing.model 必须是 Codex CLI 支持的模型")
+            elif route_effort not in efforts:
+                allowed = "/".join(sorted(efforts))
+                errs.append(f"routing.effort 对 {route_model} 必须是 {allowed}")
+        elif target == "claude" and routing.get("effort") is not None and route_effort not in CLAUDE_EFFORT_LEVELS:
+            allowed = "/".join(sorted(CLAUDE_EFFORT_LEVELS))
+            errs.append(f"routing.effort 必须是 {allowed}")
+        if (
+                routing.get("model", "").startswith("claude-fable") or
+                profile == "critical") and len(routing.get("reason", "").strip()) < 8:
+            errs.append("Fable/critical 路由必须提供至少 8 字符的 reason")
+    return errs
+
+
+def resolve_routing(env: dict) -> dict:
+    """返回按 target 分离的显式路由;默认不用 Claude Fable,保护其独立订阅额度。"""
+    requested = env.get("routing", {})
+    profile = requested.get("profile", "standard")
+    profiles = CLAUDE_ROUTING_PROFILES if env["target"] == "claude" else CODEX_ROUTING_PROFILES
+    route = dict(profiles[profile])
+    if requested.get("model"):
+        route["model"] = requested["model"]
+    if requested.get("effort"):
+        route["effort"] = requested["effort"]
+    route["profile"] = profile
+    route["reason"] = requested.get("reason", "dispatcher default")
+    return route
+
+
+def effective_role(env: dict) -> str:
+    """兼容旧信封:write 默认 implementer,read_only/verify 默认 analyst。"""
+    return env.get("role") or ("implementer" if env.get("mode") == "write" else "analyst")
+
+
+def requires_write_lease(env: dict) -> bool:
+    """verify 可运行任意测试命令,故与 write 共用互斥租约和 clean gate。
+
+    read_only 不取租约,仍可与 verify 并行。verify 之间也串行,避免测试在同一
+    worktree 产生 pycache 等可审计副作用并互相污染基线。
+    """
+    return env.get("mode") in ("write", "verify")
+
+
+def normalize_allowed_path(p: str) -> str | None:
+    """POSIX 规范化 allowed_paths 项(XB-46);不合法返回 None。
+
+    封堵 `./.git/hooks/`、`a/../.git` 等绕过:先 normpath 再做全部判定。
+    """
+    if not isinstance(p, str) or not p.strip():
+        return None
+    norm = posixpath.normpath(p.strip())
+    if norm.startswith("/") or norm in (".", "..") or norm.startswith("../"):
+        return None
+    if norm == ".git" or norm.startswith(".git/"):
+        return None
+    return norm
+
+
+def recorder_paths() -> tuple[str, ...]:
+    """返回 recorder 可写的仓库相对文档路径(AT-27)。
+
+    默认值对应本仓库的追加制日志与唯一事实台账。迁入其他仓库时可通过
+    DISPATCH_RECORDER_PATHS 以逗号分隔覆盖,避免再次硬编码旧项目目录结构。
+    未设置变量时使用本仓库默认值;一旦显式设置,非法项关闭式忽略,
+    若全部非法则返回空集并拒绝 recorder 写入,不静默放宽到默认路径。
+    """
+    raw = os.environ.get(RECORDER_PATHS_ENV)
+    candidates = raw.split(",") if raw is not None else list(DEFAULT_RECORDER_PATHS)
+    normalized = []
+    for candidate in candidates:
+        norm = normalize_allowed_path(candidate)
+        if norm and norm not in normalized:
+            normalized.append(norm)
+    return tuple(normalized) if raw is not None else DEFAULT_RECORDER_PATHS
+
+
+def recorder_path_warnings() -> list[str]:
+    """返回显式 recorder 路径配置中被关闭式丢弃的非法项(AT-31)。"""
+    raw = os.environ.get(RECORDER_PATHS_ENV)
+    if raw is None:
+        return []
+    invalid = [candidate for candidate in raw.split(",")
+               if normalize_allowed_path(candidate) is None]
+    if not invalid:
+        return []
+    rendered = ", ".join(repr(item) for item in invalid)
+    return [f"{RECORDER_PATHS_ENV} 含非法项,已关闭式忽略:{rendered}"]
+
+
+def is_recorder_path(norm_path: str) -> bool:
+    """已规范化路径是否落在配置的审阅文档范围内。"""
+    return any(norm_path == root or norm_path.startswith(root.rstrip("/") + "/")
+               for root in recorder_paths())
+
+
+def gate_check(env: dict) -> tuple[list[str], list[str]]:
+    """人工闸门:返回 (拒绝原因, 告警)。
+
+    XB-46:关键词只是告警性 tripwire,不是安全边界;真正边界是
+    capabilities() 里的能力硬收窄。仍硬拒的只有直指 .git 的写路径。
+    """
+    reasons, warnings = [], []
+    if effective_role(env) == "recorder":
+        warnings.extend(recorder_path_warnings())
+    prompt = env.get("prompt", "").lower()
+    for word in GATE_WARN_WORDS:
+        if word in prompt:
+            warnings.append(f"提示词含人工闸门动作关键词:{word!r}(仅告警,边界由能力收窄保证)")
+    if env.get("mode") == "write":
+        for p in env.get("allowed_paths", []):
+            norm = normalize_allowed_path(p)
+            if norm is None:  # validate 之外的纵深防御
+                reasons.append(f"allowed_paths 不合法或指向 .git:{p!r}")
+            elif effective_role(env) == "recorder" and not is_recorder_path(norm):
+                reasons.append(
+                    f"role=recorder 的 allowed_paths 越出配置的文档路径"
+                    f"({','.join(recorder_paths())}):{p!r}")
+    return reasons, warnings
+
+
+def capabilities(env: dict) -> dict:
+    """dispatcher 自报的能力边界(XB-46),写进结果信封供审计。"""
+    trust = "可信 agent 防误操作调度;非恶意子进程 OS 沙箱(XB-46 裁决)"
+    if env.get("session") == "shared":
+        shared_boundary = (
+            "shared protected mode requires execution cwd == audited worktree and a manual App-idle "
+            "confirmation; dispatcher locks do not cover the user App. Post-run audit only "
+            "detects off-allowlist changes and cannot prevent writes or attribute in-scope changes"
+            if env.get("mode") in ("write", "verify") else
+            "shared read_only uses a manual App-idle confirmation because dispatcher locks "
+            "do not cover the user App"
+        )
+    else:
+        shared_boundary = "not used"
+    if env["target"] == "claude":
+        if env["mode"] == "read_only":
+            mode_boundary = "permission-mode=plan; Edit/Write/Notebook/Web/Task 明确禁用"
+        elif env["mode"] == "verify":
+            mode_boundary = (
+                "Bash 可运行测试并写临时目录;Edit/Write/Notebook 明确禁用。"
+                "Bash 不能提供 OS 级仓库只写拦截,由 changed_paths=[] 与 HEAD 不前进事后硬断言检测"
+            )
+        else:
+            mode_boundary = (
+                "write allowlist + post-run path/commit audit; Bash enabled for project tests. "
+                "Trusted-agent boundary: Bash is not an OS-level network/push/merge block"
+            )
+        return {
+            "network": (
+                "WebFetch/WebSearch/浏览器/MCP blocked; Bash may still reach network "
+                "under the trusted-agent model"
+                if env["mode"] in ("write", "verify") else
+                "blocked (工具白名单不含 WebFetch/WebSearch/浏览器/MCP)"
+            ),
+            "tools": "allowedTools + explicit disallowedTools + --safe-mode --strict-mcp-config",
+            "mode_boundary": mode_boundary,
+            "routing": "model via --model; effort via --effort",
+            "fast_mode": "not selectable by dispatcher; observed from Claude init event when available",
+            "max_turns": "supported via --max-turns",
+            "git_push_merge": (
+                "not hard-blocked when Bash is enabled; main merge/push is a user gate"
+                if env["mode"] in ("write", "verify") else
+                "blocked (Bash 白名单仅 status/diff/log/show 等只读命令)"
+            ),
+            "shared_session": shared_boundary,
+            "trust_model": trust,
+        }
+    return {
+        "network": "blocked (sandbox_workspace_write.network_access=false)" if env["mode"] in ("write", "verify")
+                   else "blocked (read-only sandbox)",
+        "filesystem": (
+            "workspace-write sandbox; verify 的仓库改动由 changed_paths=[] + HEAD 不前进事后硬断言检测"
+            if env["mode"] == "verify" else
+            "workspace-write sandbox" if env["mode"] == "write" else "read-only sandbox"
+        ),
+        "config_isolation": "--ignore-user-config --strict-config",
+        "routing": "models discovered from models_cache.json; model via -m/--model; effort via -c model_reasoning_effort=...",
+        "actual_model": (
+            "Codex exec JSONL is preferred; when it omits settings, dispatcher reads the user's "
+            "local Codex rollout for the same session_id and current invocation's timestamped "
+            "turn_context. Missing/ambiguous paths, read/schema failures, or attribution failure "
+            "produce a warning and explicit unavailable; this read-only observation grants no "
+            "additional sandbox or filesystem permissions"
+        ),
+        "fast_mode": "not selectable by dispatcher; codex exec help exposes no --fast flag",
+        "max_turns": "unsupported by codex exec; dispatcher does not inject budget.max_turns",
+        "git_push_merge": "not hard-blocked by sandbox — 已知边界(Codex 裁决接受);main 合并/push 为用户闸门",
+        "shared_session": shared_boundary,
+        "trust_model": trust,
+    }
+
+
+def normalize_session_entry(value, default_cwd: Path) -> dict | None:
+    """兼容旧字符串注册项;新项必须携带 cwd 与 dispatcher 管理标记。"""
+    if isinstance(value, str) and value:
+        return {"id": value, "cwd": str(default_cwd), "managed": False,
+                "legacy": True}
+    if not isinstance(value, dict) or not isinstance(value.get("id"), str):
+        return None
+    cwd = value.get("cwd", str(default_cwd))
+    if not isinstance(cwd, str) or not cwd.startswith("/"):
+        return None
+    return {"id": value["id"], "cwd": cwd,
+            "managed": bool(value.get("managed", False)), "legacy": False}
+
+
+def normalize_shared_session_entry(value) -> dict | None:
+    """共享用户会话必须显式标记,防止把普通 task/project 槽误当长期会话。"""
+    if not isinstance(value, dict) or not value.get("user_linked"):
+        return None
+    session_id, cwd = value.get("id"), value.get("cwd")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if not isinstance(cwd, str) or not cwd.startswith("/"):
+        return None
+    return {"id": session_id, "cwd": cwd, "user_linked": True}
+
+
+def shared_session_evidence(target: str, session_id: str, cwd: Path) -> dict:
+    """以本地持久化会话元数据证明 ``session_id + cwd``(AT-63 第二段)。
+
+    Codex rollout 的 ``session_meta`` 明写 id/cwd;Claude project JSONL 的事件明写
+    sessionId/cwd。两侧都要求文件唯一定位且元数据逐字归属该 session,再比较真实路径。
+    路径或 schema 随客户端版本变化时返回 unverified,绝不从目录名或请求值臆测。
+    """
+    source = {
+        "codex": "codex_rollout_session_meta",
+        "claude": "claude_project_jsonl_event",
+    }.get(target, "unsupported_target")
+
+    def unverified(reason: str, **extra) -> dict:
+        return {"status": "unverified", "target": target, "source": source,
+                "reason": reason, **extra}
+
+    if target not in ("codex", "claude"):
+        return unverified("target 必须是 codex 或 claude")
+    if not isinstance(session_id, str) or not SHARED_SESSION_ID_RE.fullmatch(session_id):
+        return unverified("session_id 格式不安全,无法定位本机会话文件")
+    try:
+        requested_cwd = cwd.resolve()
+    except OSError as exc:
+        return unverified(f"请求 cwd 无法解析:{type(exc).__name__}: {exc}")
+
+    root = codex_sessions_root() if target == "codex" else claude_projects_root()
+    if not root.is_dir():
+        return unverified(f"会话数据根目录不存在:{root}", data_root=str(root))
+    pattern = f"*{session_id}.jsonl" if target == "codex" else f"{session_id}.jsonl"
+    try:
+        candidates = [
+            path for path in root.rglob(pattern)
+            if path.is_file() and not path.is_symlink() and
+            (path.name.startswith("rollout-") if target == "codex" else
+             path.name == f"{session_id}.jsonl")
+        ]
+    except OSError as exc:
+        return unverified(
+            f"会话文件扫描失败:{type(exc).__name__}: {exc}", data_root=str(root))
+    if len(candidates) != 1:
+        return unverified(
+            f"会话文件无法唯一定位:session_id={session_id}, candidates={len(candidates)}",
+            data_root=str(root), candidate_count=len(candidates))
+
+    candidate = candidates[0]
+    try:
+        with candidate.open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    return unverified(
+                        f"会话 JSONL 解析失败:{candidate}:{line_number}: {exc.msg}",
+                        path=str(candidate))
+                if not isinstance(event, dict):
+                    return unverified(
+                        f"会话 JSONL event 不是对象:{candidate}:{line_number}",
+                        path=str(candidate))
+                if target == "codex":
+                    if event.get("type") != "session_meta":
+                        continue
+                    payload = event.get("payload")
+                    observed_id = payload.get("id") if isinstance(payload, dict) else None
+                    observed_cwd = payload.get("cwd") if isinstance(payload, dict) else None
+                else:
+                    observed_id = event.get("sessionId")
+                    observed_cwd = event.get("cwd")
+                    if observed_id is None or observed_cwd is None:
+                        continue
+                if observed_id != session_id or not isinstance(observed_cwd, str):
+                    return unverified(
+                        f"会话元数据与请求不一致:{candidate}:{line_number}",
+                        path=str(candidate), observed_session_id=observed_id,
+                        observed_cwd=observed_cwd)
+                observed_path = Path(observed_cwd)
+                if not observed_path.is_absolute():
+                    return unverified(
+                        f"会话元数据 cwd 不是绝对路径:{candidate}:{line_number}",
+                        path=str(candidate), observed_cwd=observed_cwd)
+                try:
+                    observed_resolved = observed_path.resolve()
+                except OSError as exc:
+                    return unverified(
+                        f"会话元数据 cwd 无法解析:{type(exc).__name__}: {exc}",
+                        path=str(candidate), observed_cwd=observed_cwd)
+                if observed_resolved != requested_cwd:
+                    return unverified(
+                        "会话 cwd 与请求登记 cwd 不一致",
+                        path=str(candidate), observed_cwd=str(observed_resolved),
+                        requested_cwd=str(requested_cwd))
+                return {
+                    "status": "verified",
+                    "target": target,
+                    "source": source,
+                    "path": str(candidate),
+                    "session_id": session_id,
+                    "observed_cwd": str(observed_resolved),
+                    "requested_cwd": str(requested_cwd),
+                    "evidence_line": line_number,
+                    "verified_at": now_iso(),
+                }
+    except OSError as exc:
+        return unverified(
+            f"会话文件读取失败:{type(exc).__name__}: {exc}", path=str(candidate))
+    return unverified("会话文件缺少可归因的 id/cwd 元数据", path=str(candidate))
+
+
+def shared_session_compatible(env: dict, shared_entry: dict | None,
+                              worktree: Path) -> bool:
+    """shared 是否能承载本次模式;verify 与 write 同属受保护 cwd 绑定(AT-77)。"""
+    if shared_entry is None:
+        return False
+    if env.get("mode") == "write" and effective_role(env) != "implementer":
+        return False
+    if env.get("mode") in ("write", "verify"):
+        try:
+            return Path(shared_entry["cwd"]).resolve() == worktree.resolve()
+        except (KeyError, OSError):
+            return False
+    return True
+
+
+def enforce_shared_first(env: dict, session_mode: str,
+                         shared_compatible: bool) -> None:
+    """能共享就共享;额外 session 必须是显式、有理由的例外(用户哲学/AT-77)。"""
+    if not shared_compatible:
+        return
+    if session_mode == "auto" and env.get("shared_app_idle_confirmed") is not True:
+        raise ValueError(
+            "已登记兼容的 shared 会话;session=auto 不静默新建 task。"
+            "请先确认 App 空闲并设置 shared_app_idle_confirmed=true")
+    if session_mode in ("task", "fresh", "project"):
+        reason = env.get("session_isolation_reason")
+        if not isinstance(reason, str) or len(reason.strip()) < 8:
+            raise ValueError(
+                "已登记兼容的 shared 会话;显式专用 session 仅用于极特殊隔离场景,"
+                "必须提供 session_isolation_reason")
+
+
+def assemble_command(env: dict, sessions: dict,
+                     out_dir: Path) -> tuple[list[str], str, str | None, Path]:
+    """返回 (argv, session_kind, stdin_payload, execution_cwd)。纯函数,单测覆盖。
+
+    XB-50:claude 的 `--allowedTools` 是 variadic,会吞掉其后所有非选项参数
+    (包括逗号连接后跟随的位置提示词)。因此 claude 的提示词一律走 stdin,
+    argv 中不出现任何位置参数;codex 保持 argv 传参(真实冒烟已 PASS)。
+    """
+    target = env["target"]
+    task_id = env["task_id"]
+    budget = env.get("budget", {})  # timeout 由 subprocess 强制,不进 argv
+    reg = sessions.get(target, {})
+    task_sessions = reg.get("tasks", {})
+    prompt = build_preamble(env) + env["prompt"]
+    worktree = Path(env["worktree"])
+    if (env.get("session") == "shared" and env["mode"] == "write" and
+            effective_role(env) != "implementer"):
+        raise ValueError("session=shared + mode=write 仅允许 role=implementer")
+
+    if target == "claude":
+        route = resolve_routing(env)
+        session_mode = env.get("session", "auto")
+        shared_entry = normalize_shared_session_entry(reg.get("shared"))
+        shared_compatible = shared_session_compatible(env, shared_entry, worktree)
+        enforce_shared_first(env, session_mode, shared_compatible)
+        use_shared = session_mode == "shared" or (
+            session_mode == "auto" and
+            env.get("shared_app_idle_confirmed") is True and
+            shared_compatible
+        )
+        # --safe-mode/--strict-mcp-config:隔离仓库/用户级 hooks、plugins 与 MCP(XB-46)
+        argv = ["claude", "-p", "--output-format", "stream-json",
+                "--verbose", "--include-partial-messages",
+                "--safe-mode", "--strict-mcp-config",
+                "--model", route["model"], "--effort", route["effort"]]
+        if not use_shared:
+            argv += ["--name", f"agent-dispatch:{task_id}"]
+        mt = budget.get("max_turns")
+        if mt:
+            argv += ["--max-turns", str(mt)]
+        if env["mode"] == "read_only":
+            argv += ["--allowedTools", ",".join(READ_ONLY_CLAUDE_TOOLS),
+                     "--disallowedTools", ",".join(READ_ONLY_CLAUDE_DENIED_TOOLS),
+                     "--permission-mode", "plan"]
+        elif env["mode"] == "verify":
+            # 验证可运行测试、写 /tmp;Edit/Write 仍不授权。Bash 是刻意的
+            # 命令行能力,仓库写入由 post-run 硬断言检测而非伪装成 OS 阻止。
+            argv += ["--allowedTools", ",".join(VERIFY_CLAUDE_TOOLS),
+                     "--disallowedTools", ",".join(VERIFY_CLAUDE_DENIED_TOOLS),
+                     "--permission-mode", "acceptEdits"]
+        else:
+            argv += ["--allowedTools", ",".join(WRITE_CLAUDE_TOOLS),
+                     "--disallowedTools", ",".join(WRITE_CLAUDE_DENIED_TOOLS),
+                     "--permission-mode", "acceptEdits"]
+        task_entry = normalize_session_entry(task_sessions.get(task_id), worktree)
+        project_entry = normalize_session_entry(reg.get("project"), worktree)
+        if use_shared:
+            if shared_entry is None:
+                raise ValueError("Claude shared 会话未登记或缺少 user_linked 标记")
+            kind = "resume_shared"
+            execution_cwd = Path(shared_entry["cwd"])
+            if (env["mode"] in ("write", "verify") and
+                    execution_cwd.resolve() != worktree.resolve()):
+                raise ValueError(
+                    f"Claude shared {env['mode']} 会话 cwd 与审计 worktree 不一致;"
+                    "受保护模式要求两者真实路径完全相同")
+            argv += ["--resume", shared_entry["id"]]
+        elif task_entry is not None and session_mode in ("auto", "task"):
+            if not task_entry["managed"]:
+                if requires_write_lease(env):
+                    raise ValueError("Claude task session 不是 dispatcher 专用会话")
+                kind = "fresh_legacy_migration"
+                execution_cwd = worktree
+            else:
+                kind = "resume_task"
+                execution_cwd = Path(task_entry["cwd"])
+                if (requires_write_lease(env) and
+                        execution_cwd.resolve() != worktree.resolve()):
+                    raise ValueError("Claude write/verify 会话 cwd 与审计 worktree 不一致")
+                argv += ["--resume", task_entry["id"]]
+        elif project_entry is not None and env.get("session", "auto") in ("auto", "project"):
+            if not project_entry["managed"]:
+                if requires_write_lease(env):
+                    raise ValueError("Claude project session 不是 dispatcher 专用会话")
+                kind = "fresh_legacy_migration"
+                execution_cwd = worktree
+            else:
+                kind = "fork_project"
+                execution_cwd = Path(project_entry["cwd"])
+                if (requires_write_lease(env) and
+                        execution_cwd.resolve() != worktree.resolve()):
+                    raise ValueError("Claude write/verify 项目会话 cwd 与审计 worktree 不一致")
+                argv += ["--resume", project_entry["id"], "--fork-session"]
+        else:
+            kind = "fresh"
+            execution_cwd = worktree
+        return argv, kind, prompt, execution_cwd
+
+    # codex:无非交互 fork —— 任务首跳 fresh,任务内 resume(全局参数在子命令前)
+    # --ignore-user-config/--strict-config:隔离用户自定义配置与 MCP(XB-46)
+    route = resolve_routing(env)
+    argv = ["codex", "exec", "--json", "--ignore-user-config", "--strict-config",
+            "-m", route["model"], "-c", f"model_reasoning_effort={route['effort']}",
+            "-s", "read-only" if env["mode"] == "read_only" else "workspace-write",
+            "-o", str(out_dir / "last-message.txt")]
+    if env["mode"] in ("write", "verify"):
+        argv += ["-c", "sandbox_workspace_write.network_access=false"]
+    if env["mode"] == "write":
+        # AT-19:linked worktree 的 git metadata 在沙箱外,不授权则无法提交。
+        meta_roots = git_metadata_roots(worktree)
+        if meta_roots:
+            argv += ["-c", "sandbox_workspace_write.writable_roots=" +
+                     json.dumps(meta_roots)]
+    codex_session_mode = env.get("session", "auto")
+    if codex_session_mode == "project":
+        raise ValueError("codex 不支持非交互项目会话 fork;请用 auto/task/fresh/shared")
+    shared_entry = normalize_shared_session_entry(reg.get("shared"))
+    shared_compatible = shared_session_compatible(env, shared_entry, worktree)
+    enforce_shared_first(env, codex_session_mode, shared_compatible)
+    use_shared = codex_session_mode == "shared" or (
+        codex_session_mode == "auto" and
+        env.get("shared_app_idle_confirmed") is True and
+        shared_compatible
+    )
+    if use_shared:
+        # AT-22:恢复用户原始长期 Codex 对话,使审阅结论直接追加在该对话下面。
+        # 与 Claude shared 同规:不改名、从原 cwd 启动、失败关闭式不降级。
+        if shared_entry is None:
+            raise ValueError("Codex shared 会话未登记或缺少 user_linked 标记")
+        kind = "resume_shared"
+        execution_cwd = Path(shared_entry["cwd"])
+        if (env["mode"] in ("write", "verify") and
+                execution_cwd.resolve() != worktree.resolve()):
+            raise ValueError(
+                f"Codex shared {env['mode']} 会话 cwd 与审计 worktree 不一致;"
+                "受保护模式要求两者真实路径完全相同")
+        # AT-22 实测:用户主对话常起于非仓库目录(如 ~/Desktop),而 codex exec
+        # 默认拒绝在 Git 仓库外运行("Not inside a trusted directory")。shared 的
+        # cwd 由用户会话决定、不可改,故 read_only 必须放行该检查。仅限 read_only:
+        # AT-26 shared write 已硬断言 cwd==worktree,不需要也不允许放宽。
+        if env["mode"] == "read_only":
+            argv += ["--skip-git-repo-check"]
+        argv += ["resume", shared_entry["id"], prompt]
+        return argv, kind, None, execution_cwd
+    if task_id in task_sessions and codex_session_mode in ("auto", "task"):
+        kind = "resume_task"
+        task_entry = normalize_session_entry(task_sessions[task_id], worktree)
+        if task_entry is None:
+            raise ValueError("Codex task session 登记项无效")
+        argv += ["resume", task_entry["id"], prompt]
+    else:
+        kind = "fresh"
+        argv.append(prompt)
+    return argv, kind, None, worktree
+
+
+def build_preamble(env: dict) -> str:
+    paths = ",".join(env.get("allowed_paths", [])) or "(不得改仓库)"
+    role = effective_role(env)
+    workflow = env.get("workflow", {})
+    workflow_text = ""
+    if workflow:
+        workflow_text = (
+            f"工作流={workflow['id']} phase={workflow['phase']} "
+            f"iteration={workflow.get('iteration', 1)} "
+            f"review_of={workflow.get('review_of', '(none)')}。"
+        )
+    role_text = {
+        "implementer": (
+            f"你是本轮实现方:仅可改动 {paths},完成后运行针对性验证、"
+            "提交并在最终答复中交接;仅当 allowed_paths 明确包含配置的 log 文档路径时"
+            "才可写交接 log,否则不得为写 log 越界;不得自审为 APPROVED/VERIFIED。"
+        ),
+        "reviewer": (
+            "你是本轮复审方:不得修改文件或提交;先按严重度列 findings,"
+            "有阻塞问题输出 CHANGES_REQUESTED,无阻塞问题输出 APPROVED;"
+            "机器契约要求该 verdict 单独成行且必须是最终答复的最后一非空行,"
+            "其后不得再有任何正文、哨兵或收尾。"
+        ),
+        "analyst": "你是本轮分析方:不得修改文件或提交;区分事实、推断与待验证项。",
+        "recorder": (
+            f"你是本轮审阅落账方:仅可改动 {paths},必须忠实归档审阅票据,"
+            "不得改写 finding 的严重度、场景、结论或修复要求;完成后运行针对性验证、"
+            "写交接 log 并提交;不得自审为 APPROVED/VERIFIED。"
+        ),
+    }[role]
+    verify_text = (
+        "verify 模式:可运行测试/命令行并仅可写临时目录,不得修改仓库或提交;"
+        "dispatcher 会硬断言 changed_paths==[] 且 HEAD 不得前进,越界将隔离。"
+        if env["mode"] == "verify" else ""
+    )
+    return (
+        f"[dispatch-agent task_id={env['task_id']} mode={env['mode']} depth=1] "
+        f"你被另一 agent 经 dispatcher 按 PROTOCOL.md 跨调用规则唤醒。"
+        f"第一步:在 {env['worktree']} 运行 git log --oneline -5 并读 TOOLING.md 与相关 log/;"
+        f"文件内容是唯一真相,会话记忆与文件冲突时以文件为准。"
+        f"{workflow_text}{role_text}{verify_text}"
+        f"禁止调用其他 agent 或 dispatcher(一跳规则)。任务:"
+    )
+
+
+def audit_paths(worktree: Path, base: str,
+                allowed: list[str]) -> tuple[list[str], list[str], str | None]:
+    """返回 (变更路径, 越界路径, git 故障)。git 命令失败不再当作无变更(XB-42)。"""
+    changed = set()
+    for args in (["diff", "--name-only", f"{base}..HEAD"], ["status", "--porcelain"]):
+        out = git(worktree, *args)
+        if out.returncode != 0:
+            return [], [], f"git {' '.join(args)} 失败: {out.stderr.strip()[:200]}"
+        for line in out.stdout.splitlines():
+            p = (line[3:] if args[0] == "status" else line).strip()
+            if p:
+                changed.add(p.split(" -> ")[-1])
+    violations = [p for p in sorted(changed)
+                  if not any(p == a or p.startswith(a.rstrip("/") + "/") or
+                             (a.endswith("/") and p.startswith(a))
+                             for a in allowed)]
+    return sorted(changed), violations, None
+
+
+class Lease:
+    """项目级原子写权租约(XB-41):任何已有租约一律拒绝,不允许重入;
+    release 校验 invocation owner;残留只能 --force-release 清理并留审计。"""
+
+    def __init__(self, runtime: Path):
+        self.path = runtime / "lease.json"
+        self.lock = runtime / "lease.lock"
+        self.audit = runtime / "lease-audit.log"
+
+    def acquire(self, task_id: str, holder: str, worktree: str,
+                base: str, owner: str) -> str | None:
+        """成功返回 None,失败返回持有者描述。"""
+        try:
+            fd = os.open(self.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+            cur = self.read()
+            return json.dumps(cur, ensure_ascii=False) if cur else "残留 lease.lock(用 --force-release 清理)"
+        record = {"task_id": task_id, "holder": holder, "worktree": worktree,
+                  "base_commit": base, "owner": owner, "acquired_at": now_iso()}
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(record, ensure_ascii=False))
+        self.path.write_text(json.dumps(record, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+        return None
+
+    def read(self) -> dict | None:
+        for p in (self.path, self.lock):
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError):
+                continue
+        return None
+
+    def release(self, owner: str) -> bool:
+        cur = self.read()
+        if cur and cur.get("owner") == owner:
+            self.path.unlink(missing_ok=True)
+            self.lock.unlink(missing_ok=True)
+            return True
+        return False
+
+    def force_release(self, reason: str) -> None:
+        cur = self.read()
+        with self.audit.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"at": now_iso(), "action": "force-release",
+                                "previous": cur, "reason": reason},
+                               ensure_ascii=False) + "\n")
+        self.path.unlink(missing_ok=True)
+        self.lock.unlink(missing_ok=True)
+
+
+class ConversationLease:
+    """会话级原子锁:允许不同 task 并行只读,但禁止同一 shared/task/project
+    会话被两个顶层 orchestrator 同时 resume,避免上下文交错。
+    """
+
+    def __init__(self, runtime: Path, create: bool = True):
+        self.directory = runtime / "conversation-locks"
+        if create:
+            self.directory.mkdir(parents=True, exist_ok=True)
+        self.audit = runtime / "conversation-lock-audit.log"
+
+    def _path(self, key: str) -> Path:
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        return self.directory / f"{digest}.json"
+
+    def acquire(self, key: str, owner: str, task_id: str, target: str) -> str | None:
+        path = self._path(key)
+        record = {"key": key, "owner": owner, "task_id": task_id,
+                  "target": target, "pid": os.getpid(), "at": now_iso()}
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+            try:
+                return path.read_text(encoding="utf-8")
+            except OSError:
+                return f"会话锁已存在:{path.name}"
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+        return None
+
+    def release(self, key: str, owner: str) -> bool:
+        path = self._path(key)
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if record.get("owner") != owner:
+            return False
+        path.unlink(missing_ok=True)
+        return True
+
+    def records(self) -> list[tuple[Path, dict]]:
+        records = []
+        for path in self.directory.glob("*.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                record = {"key": path.stem, "corrupt": True}
+            records.append((path, record))
+        return records
+
+    def force_release_matching(self, confirm: str, reason: str) -> int:
+        removed = 0
+        for path, record in self.records():
+            expected = {record.get("task_id"), record.get("owner"), record.get("key")}
+            if confirm not in expected:
+                continue
+            with self.audit.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"at": now_iso(), "action": "force-release",
+                                    "previous": record, "reason": reason},
+                                   ensure_ascii=False) + "\n")
+            path.unlink(missing_ok=True)
+            removed += 1
+        return removed
+
+
+class DispatchQueue:
+    """AT-35:双向共享的可见队列。
+
+    队列记录是可观测性与公平层;真正的互斥边界仍由 Lease 与
+    ConversationLease 的原子创建提供。记录保留终态,便于双方与用户
+    查询谁在等、等什么、最后为何结束。
+    """
+
+    ACTIVE_STATES = {"queued", "waiting_resource", "running"}
+
+    def __init__(self, runtime: Path, create: bool = True):
+        self.runtime = runtime
+        self.directory = runtime / "queue"
+        if create:
+            self.directory.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, invocation: str) -> Path:
+        return self.directory / f"{invocation}.json"
+
+    def _liveness_path(self, invocation: str) -> Path:
+        return self.directory / f"{invocation}{LIVENESS_SUFFIX}"
+
+    def _liveness_acquire(self, invocation: str) -> bool:
+        """占住本调用的存活锁;进程无论怎么死,OS 都会释放它(AT-25)。"""
+        if fcntl is None:
+            return False
+        path = self._liveness_path(invocation)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            return False
+        try:
+            os.set_inheritable(fd, False)  # 子 CLI 不得继承,否则它会替死进程"续命"
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, json.dumps({"invocation": invocation, "pid": os.getpid(),
+                                     "at": now_iso()}, ensure_ascii=False).encode())
+        except OSError:
+            os.close(fd)
+            return False
+        _LIVENESS_FDS[str(path)] = fd
+        return True
+
+    def _liveness_release(self, invocation: str, unlink: bool = True) -> None:
+        path = self._liveness_path(invocation)
+        fd = _LIVENESS_FDS.pop(str(path), None)
+        if fd is not None:
+            try:
+                os.close(fd)  # 关闭即释放锁
+            except OSError:
+                pass
+        if unlink:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def liveness_state(self, invocation: str) -> str:
+        """存活锁判定:alive / dead / unknown(无锁文件或平台不支持)。"""
+        if fcntl is None or not isinstance(invocation, str):
+            return "unknown"
+        path = self._liveness_path(invocation)
+        if str(path) in _LIVENESS_FDS:
+            return "alive"  # 本进程自己持有:不必也不能对自己的锁再测一次
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except OSError:
+            return "unknown"
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "alive"  # 仍被登记者持有
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return "dead"  # OS 已回收 → 登记者进程确实没了
+        finally:
+            os.close(fd)
+
+    def register(self, record: dict) -> None:
+        invocation = record["invocation"]
+        path = self._path(invocation)
+        owns_liveness = (record.get("pid") == os.getpid() and
+                         self._liveness_acquire(invocation))
+        initial = {
+            **record,
+            "liveness": "process_lock" if owns_liveness else "pid_only",
+            "state": "queued",
+            "queued_at": now_iso(),
+            "queued_at_ns": time.time_ns(),
+            "updated_at": now_iso(),
+            "waiting_for": [],
+            "history": [{"at": now_iso(), "state": "queued"}],
+        }
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(initial, f, ensure_ascii=False, indent=2)
+        except Exception:
+            if owns_liveness:
+                self._liveness_release(invocation)
+            raise
+
+    def read(self, invocation: str) -> dict | None:
+        try:
+            return json.loads(self._path(invocation).read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+
+    def update(self, invocation: str, state: str | None = None,
+               prune_on_terminal: bool = True, **fields) -> dict | None:
+        record = self.read(invocation)
+        if record is None:
+            return None
+        previous = record.get("state")
+        if state is not None:
+            record["state"] = state
+        record.update(fields)
+        record["updated_at"] = now_iso()
+        if state is not None and (state != previous or fields.get("waiting_for") is not None):
+            history = record.setdefault("history", [])
+            event = {"at": record["updated_at"], "state": state}
+            if "waiting_for" in fields:
+                event["waiting_for"] = fields["waiting_for"]
+            history.append(event)
+            record["history"] = history[-50:]
+        tmp = self.directory / f".{invocation}.{os.getpid()}.{threading.get_ident()}.tmp"
+        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, self._path(invocation))
+        if state is not None and state not in self.ACTIVE_STATES:
+            # 终态记录不再需要存活证据,连锁文件一起回收,不留垃圾。
+            self._liveness_release(invocation)
+        if (prune_on_terminal and state is not None and state not in self.ACTIVE_STATES and
+                previous in self.ACTIVE_STATES):
+            self.prune()
+        return record
+
+    def records(self) -> list[dict]:
+        records = []
+        for path in self.directory.glob("*.json"):
+            try:
+                records.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError):
+                records.append({"invocation": path.stem, "state": "corrupt"})
+        return sorted(records, key=lambda r: (r.get("queued_at_ns", 0),
+                                              r.get("invocation", "")))
+
+    def resource_owners(self) -> dict[str, dict]:
+        """owner(invocation) → 它当前占着的资源。用于 orphan 诊断与保留策略。
+
+        lease.lock 与 lease.json 都要看:acquire 先写 .lock 再写 .json,
+        dispatcher 恰好死在这两步之间时,只有 .lock 记得住持有者。
+        """
+        owners: dict[str, dict] = {}
+        entries: list[tuple[str, Path]] = [("write_lease", self.runtime / "lease.json"),
+                                           ("write_lease", self.runtime / "lease.lock")]
+        entries.extend(("conversation", path) for path in
+                       (self.runtime / "conversation-locks").glob("*.json"))
+        for kind, path in entries:
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            owner = record.get("owner")
+            if not isinstance(owner, str):
+                continue
+            held = owners.setdefault(owner, {"write_lease": False,
+                                             "conversation_locks": []})
+            if kind == "write_lease":
+                held["write_lease"] = True
+            else:
+                key = record.get("key")
+                if isinstance(key, str) and key not in held["conversation_locks"]:
+                    held["conversation_locks"].append(key)
+        return owners
+
+    def _referenced_owners(self) -> set[str]:
+        """残留资源锁仍需 orphan 记录做持有者诊断,不可被保留策略先删。"""
+        return set(self.resource_owners())
+
+    def orphan_details(self, probe_children: bool = False) -> list[dict]:
+        """AT-25:每个 orphan 的死亡证据 + 它卡住的资源 + 残留子 CLI。
+
+        这是**诊断**,不是自动解锁:dispatcher 绝不因为持有者死了就放锁。
+        """
+        owners = self.resource_owners()
+        details = []
+        for record in self.snapshot()["orphaned"]:
+            invocation = record.get("invocation")
+            held = owners.get(invocation, {"write_lease": False,
+                                           "conversation_locks": []})
+            holds = dict(held)
+            child_pid = record.get("child_pid")
+            child = None
+            if isinstance(child_pid, int):
+                child = (probe_process(child_pid) if probe_children else
+                         {"pid": child_pid, "alive": "unprobed", "command": "unprobed"})
+            holds["child_cli"] = child
+            actions = []
+            if held.get("write_lease") or held.get("conversation_locks"):
+                actions.append("manual --force-release required")
+            if child is not None and child.get("alive") is True:
+                # dispatcher 死了但子 CLI 没死:它是不受租约管辖的第二写者,
+                # 我们既杀不了它(进程已失去父进程),也不能假装它不存在。
+                actions.append(
+                    f"child CLI still running (pid={child['pid']} "
+                    f"command={child['command']}); it is an unsupervised second writer — "
+                    "terminate it manually before force-release")
+            details.append({
+                "invocation": invocation,
+                "task_id": record.get("task_id"),
+                "target": record.get("target"),
+                "mode": record.get("mode"),
+                "state": record.get("state"),
+                "pid": record.get("pid"),
+                "session_id": record.get("session_id"),
+                "conversation_key": record.get("conversation_key"),
+                "orphan_evidence": self.liveness(record)[1],
+                "holds": holds,
+                "action": "; ".join(actions) or "no resource held; record only",
+            })
+        return details
+
+    def prune(self, retain_terminal: int = QUEUE_TERMINAL_RETENTION,
+              retain_orphaned: int = QUEUE_ORPHAN_RETENTION) -> int:
+        """队列快照有界保留;完整原始结果仍在 results/ 下。"""
+        records = self.records()
+        terminal = [r for r in records if r.get("state") not in self.ACTIVE_STATES]
+        remove = terminal[:-retain_terminal] if retain_terminal > 0 else terminal
+        orphaned = [r for r in records
+                    if r.get("state") in self.ACTIVE_STATES and not self.process_alive(r)]
+        referenced = self._referenced_owners()
+        removable_orphans = [r for r in orphaned
+                             if r.get("invocation") not in referenced]
+        excess = max(0, len(orphaned) - retain_orphaned)
+        remove.extend(removable_orphans[:excess])
+        removed = 0
+        for record in remove:
+            invocation = record.get("invocation")
+            if not isinstance(invocation, str):
+                continue
+            try:
+                self._path(invocation).unlink()
+                removed += 1
+            except FileNotFoundError:
+                pass
+            self._liveness_release(invocation)
+        return removed
+
+    def force_release_matching(self, confirm: str, reason: str) -> dict:
+        """人工确认后把匹配的死进程记录收敛为终态;活进程不动。"""
+        matched: list[str] = []
+        marked = 0
+        for record in self.records():
+            if record.get("state") not in self.ACTIVE_STATES or self.process_alive(record):
+                continue
+            expected = {record.get("task_id"), record.get("invocation"),
+                        record.get("conversation_key")}
+            if confirm not in expected:
+                continue
+            matched.append(record["invocation"])
+            updated = self.update(
+                record["invocation"], "force_released", prune_on_terminal=False,
+                force_release_reason=reason, force_released_at=now_iso())
+            if updated is not None:
+                marked += 1
+        pruned = self.prune()
+        retained = sum(
+            1 for invocation in matched
+            if (self.read(invocation) or {}).get("state") == "force_released"
+        )
+        return {"matched": len(matched), "marked": marked,
+                "retained": retained, "pruned": pruned}
+
+    def liveness(self, record: dict) -> tuple[bool, str]:
+        """返回 (是否存活, 证据)。证据如实回写给 --status,不做无根据的推断。
+
+        顺序是有意的:pid 已消失就是确证,连文件都不用开;pid 看着还在时才
+        用存活锁消歧——**pid 会被 OS 复用**,只看 pid 会把死掉的 dispatcher
+        误报成活的,那样 orphan 永远清不掉,人工 force-release 也会拒绝它。
+        """
+        pid = record.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return True, "no-pid: 记录未带 pid,不猜测为死进程"
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False, "pid-gone: 进程不存在"
+        except PermissionError:
+            pass  # 属于别的用户:仍需存活锁消歧
+        except OSError as exc:
+            return True, f"pid-probe-unavailable: {type(exc).__name__}"
+        state = self.liveness_state(record.get("invocation"))
+        if state == "dead":
+            return False, "process-lock-released: pid 已被复用,登记者进程已退出"
+        if state == "alive":
+            return True, "process-lock-held: 登记者进程仍持有存活锁"
+        return True, ("pid-alive-only: 无存活锁文件,仅凭 pid 判定"
+                      "(pid 复用不可区分)")
+
+    def process_alive(self, record: dict) -> bool:
+        return self.liveness(record)[0]
+
+    @staticmethod
+    def conflicts(left: dict, right: dict) -> bool:
+        same_conversation = (
+            left.get("conversation_key") and
+            left.get("conversation_key") == right.get("conversation_key")
+        )
+        # 保持现有“项目级唯一受保护写者”裁决;read_only 不与它互斥。
+        same_write_resource = bool(left.get("protected_mode") and
+                                   right.get("protected_mode"))
+        return bool(same_conversation or same_write_resource)
+
+    def predecessors(self, invocation: str) -> list[dict]:
+        current = self.read(invocation)
+        if current is None:
+            return []
+        current_order = (current.get("queued_at_ns", 0), invocation)
+        return [
+            record for record in self.records()
+            if record.get("state") in self.ACTIVE_STATES
+            and self.process_alive(record)
+            and record.get("invocation") != invocation
+            and (record.get("queued_at_ns", 0), record.get("invocation", "")) < current_order
+            and self.conflicts(current, record)
+        ]
+
+    def snapshot(self, recent_limit: int = 20) -> dict:
+        records = self.records()
+        active = [r for r in records
+                  if r.get("state") in self.ACTIVE_STATES and self.process_alive(r)]
+        orphaned = [r for r in records
+                    if r.get("state") in self.ACTIVE_STATES and not self.process_alive(r)]
+        terminal = [r for r in records if r.get("state") not in self.ACTIVE_STATES]
+        active_views = []
+        for overall_position, record in enumerate(active, start=1):
+            conflicts_ahead = [
+                other for other in active
+                if (other.get("queued_at_ns", 0), other.get("invocation", "")) <
+                   (record.get("queued_at_ns", 0), record.get("invocation", ""))
+                and self.conflicts(record, other)
+            ]
+            active_views.append({**record,
+                                 "overall_position": overall_position,
+                                 "resource_position": len(conflicts_ahead) + 1})
+        return {"active": active_views, "orphaned": orphaned,
+                "recent": terminal[-recent_limit:]}
+
+
+def resource_holder_details(raw: str, queue: DispatchQueue) -> dict:
+    """保留原子租约返回的持有者票据,并关联已死队列进程。"""
+    try:
+        record = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        record = {"raw": raw}
+    if not isinstance(record, dict):
+        record = {"raw": raw}
+    owner = record.get("owner")
+    orphaned_ids = {item.get("invocation") for item in queue.snapshot()["orphaned"]}
+    orphaned = isinstance(owner, str) and owner in orphaned_ids
+    return {
+        "record": record,
+        "owner": owner,
+        "owner_orphaned": orphaned,
+        "action": ("manual --force-release required" if orphaned else None),
+    }
+
+
+def conversation_key(env: dict, sessions: dict, session_kind: str) -> str:
+    """为实际被 resume/fork/创建的会话选择稳定锁键。"""
+    target, task_id = env["target"], env["task_id"]
+    reg = sessions.get(target, {})
+    if session_kind == "resume_shared":
+        entry = normalize_shared_session_entry(reg.get("shared"))
+        return f"{target}:shared:{entry['id']}"
+    if session_kind == "resume_task":
+        # 按 task_id 而非当前 session ID 锁定:失效会话降级 fresh 时
+        # 锁键不变,避免另一调用在清除旧登记后并发创建第二会话。
+        return f"{target}:task-id:{task_id}"
+    if session_kind == "fork_project":
+        entry = normalize_session_entry(reg.get("project"), Path(env["worktree"]))
+        return f"{target}:project-session:{entry['id']}"
+    # fresh/迁移/fallback 首跳按 task_id 串行,防止同 task 双创建分叉会话。
+    return f"{target}:task-id:{task_id}"
+
+
+class Quarantine:
+    """失败隔离区(XB-42/45):污染的 worktree 在人工确认前拒绝新的 write 任务。"""
+
+    def __init__(self, runtime: Path):
+        self.path = runtime / "quarantine.json"
+
+    def read(self) -> dict | None:
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    def mark(self, info: dict) -> None:
+        self.path.write_text(json.dumps({**info, "at": now_iso()},
+                                        ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def clear(self, audit: Path, reason: str) -> None:
+        with audit.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"at": now_iso(), "action": "clear-quarantine",
+                                "previous": self.read(), "reason": reason},
+                               ensure_ascii=False) + "\n")
+        self.path.unlink(missing_ok=True)
+
+
+def update_sessions(runtime: Path, mutate, lock_timeout_s: float | None = None) -> dict | None:
+    """锁内读-改-写会话表,tmp+replace 原子落盘(XB-44)。锁忙超时放弃返回 None。
+
+    锁文件写入 pid/时间(XB-48),供 --force-release 审计清理残留;
+    超时可用环境变量 DISPATCH_SESSIONS_LOCK_TIMEOUT 覆盖(测试用)。
+    """
+    lock = runtime / "sessions.lock"
+    timeout = (float(os.environ.get("DISPATCH_SESSIONS_LOCK_TIMEOUT", "5"))
+               if lock_timeout_s is None else lock_timeout_s)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, json.dumps({"pid": os.getpid(), "at": now_iso()}).encode())
+            break
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+            if time.monotonic() > deadline:
+                return None
+            time.sleep(0.05)
+    try:
+        path = runtime / "sessions.json"
+        try:
+            sessions = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            sessions = {}
+        mutate(sessions)
+        tmp = runtime / f"sessions.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(sessions, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, path)
+        return sessions
+    finally:
+        os.close(fd)
+        lock.unlink(missing_ok=True)
+
+
+def read_sessions(runtime: Path) -> dict:
+    try:
+        return json.loads((runtime / "sessions.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def extract_session_id(target: str, data: dict) -> str | None:
+    """单个事件里的会话/线程 ID;流式早登记与收尾解析共用同一份认知(AT-25)。"""
+    if not isinstance(data, dict):
+        return None
+    if target == "claude":
+        if ((data.get("type") == "system" and data.get("subtype") == "init") or
+                data.get("type") == "result"):
+            session_id = data.get("session_id")
+            return session_id if isinstance(session_id, str) and session_id else None
+        return None
+    tid = data.get("thread_id")
+    if not tid and isinstance(data.get("thread"), dict):
+        tid = data["thread"].get("id")
+    if not tid and data.get("type") == "thread.started":
+        tid = data.get("id")
+    return tid if isinstance(tid, str) and tid else None
+
+
+def register_session(runtime: Path, env: dict, session_id: str, cwd: Path,
+                     session_kind: str,
+                     lock_timeout_s: float | None = 5.0) -> bool:
+    """把会话 ID 原子写回登记表;锁忙返回 False(AT-25)。
+
+    早登记与收尾登记共用这一个槽位语义,防止两条路径漂移:shared 只写
+    user_linked 的 shared 槽,其余一律写 dispatcher 管理的 task 槽——
+    绝不让 shared 会话 ID 落进 task 槽,反之亦然。
+    """
+    def _mut(sessions: dict) -> None:
+        target_state = sessions.setdefault(env["target"], {})
+        entry = {"id": session_id, "cwd": str(cwd), "updated_at": now_iso()}
+        if session_kind == "resume_shared":
+            target_state["shared"] = {**entry, "user_linked": True}
+            return
+        target_state.setdefault("tasks", {})[env["task_id"]] = {**entry, "managed": True}
+    # 流式登记线程必须有固定上界,不能被测试/运维环境把全局锁超时调到
+    # join 上界之外后迟到覆盖 queue 终态。收尾路径可再按环境配置重试。
+    return update_sessions(runtime, _mut, lock_timeout_s=lock_timeout_s) is not None
+
+
+def parse_output(target: str, stdout_text: str, last_msg_file: Path | None = None) -> dict:
+    """提取 session/thread id 与最终文本;codex 兼容真实嵌套事件并以 -o 文件兜底(XB-43)。"""
+    info = {"session_id": None, "last_message": None, "actual_model": None,
+            "fast_mode": None, "service_tier": None, "speed": None,
+            "usage": None, "equivalent_cost_usd": None,
+            "terminal_reason": None, "result_subtype": None,
+            "target_errors": [],
+            # AT-80:空列表本身无法区分"已归纳且无错"与"该 target 不归纳此类事件"。
+            # 列表保持兼容,语义另立字段,由各 target 分支如实填写。
+            "target_errors_observation": None}
+    if target == "claude":
+        # Claude 的 stream-json 不发 codex 那种 item.type=error 事件;错误经
+        # result.subtype/terminal_reason 与非零退出表达。此处如实标 unsupported,
+        # 不拿 [] 冒充"已观测无错"(CONTEXT §3.2)。
+        info["target_errors_observation"] = {
+            "status": "unsupported",
+            "source": "claude_stream_json",
+            "reason": "Claude stream-json 无 target error item 事件;"
+                      "错误由 result.subtype/terminal_reason 与退出码表达",
+        }
+        for line in stdout_text.splitlines():
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            info["session_id"] = extract_session_id("claude", data) or info["session_id"]
+            if data.get("type") == "system" and data.get("subtype") == "init":
+                info["actual_model"] = data.get("model") or info["actual_model"]
+                info["fast_mode"] = data.get("fast_mode_state")
+            elif data.get("type") == "assistant" and isinstance(data.get("message"), dict):
+                message = data["message"]
+                info["actual_model"] = message.get("model") or info["actual_model"]
+                usage = message.get("usage", {})
+                info["service_tier"] = usage.get("service_tier") or info["service_tier"]
+                info["speed"] = usage.get("speed") or info["speed"]
+                texts = [block.get("text", "") for block in message.get("content", [])
+                         if block.get("type") == "text"]
+                if texts:
+                    info["last_message"] = "\n".join(texts)
+            elif data.get("type") == "result":
+                info["terminal_reason"] = data.get("terminal_reason")
+                info["result_subtype"] = data.get("subtype")
+                info["last_message"] = data.get("result") or info["last_message"]
+                info["usage"] = data.get("usage")
+                info["equivalent_cost_usd"] = data.get("total_cost_usd")
+                usage = data.get("usage") or {}
+                info["service_tier"] = usage.get("service_tier") or info["service_tier"]
+                info["speed"] = usage.get("speed") or info["speed"]
+                model_usage = data.get("modelUsage") or {}
+                if not info["actual_model"] and model_usage:
+                    info["actual_model"] = next(iter(model_usage))
+        # 兼容 v3 桩与旧 Claude 单 JSON 结果。
+        if info["session_id"] is None:
+            try:
+                data = json.loads(stdout_text)
+                info["session_id"] = data.get("session_id")
+                info["last_message"] = data.get("result")
+            except json.JSONDecodeError:
+                info["last_message"] = stdout_text[-2000:] or None
+        return info
+    # AT-80:codex 侧确实归纳 item.type=error,故 [] 在这里是"已观测且无错"的真值。
+    info["target_errors_observation"] = {
+        "status": "observed",
+        "source": "codex_exec_jsonl_error_items",
+        "reason": "codex exec JSONL 的 item.type=error 已被归纳;空列表表示本次未观测到该类事件",
+    }
+    for line in stdout_text.splitlines():
+        try:
+            evt = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload = evt.get("payload") if isinstance(evt.get("payload"), dict) else {}
+        settings = {}
+        if evt.get("type") == "thread_settings_applied":
+            settings = evt.get("thread_settings") or {}
+        elif payload.get("type") == "thread_settings_applied":
+            settings = payload.get("thread_settings") or {}
+        if isinstance(settings, dict):
+            info["actual_model"] = settings.get("model") or info["actual_model"]
+            info["service_tier"] = settings.get("service_tier") or info["service_tier"]
+            info["speed"] = settings.get("speed") or info["speed"]
+            if payload.get("reasoning_effort") and info["usage"] is None:
+                info["usage"] = {"reasoning_effort": payload.get("reasoning_effort")}
+        if isinstance(evt.get("usage"), dict):
+            info["usage"] = evt["usage"]
+        if evt.get("total_cost_usd") is not None:
+            info["equivalent_cost_usd"] = evt.get("total_cost_usd")
+        info["session_id"] = extract_session_id("codex", evt) or info["session_id"]
+        item = evt.get("item")
+        if evt.get("type") == "item.completed" and isinstance(item, dict):
+            if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                info["last_message"] = item["text"]
+            elif item.get("type") == "error":
+                # AT-79:缺 message 的 error item 以前被整条跳过——live-text 有
+                # "codex error item" 兜底给人看,机器票据却什么都不剩。错误发生过
+                # 这个事实不能因为缺字段就消失;此处与 clean_event_text 的兜底对齐。
+                message = item.get("message")
+                if not isinstance(message, str) or not message.strip():
+                    message = "codex error item(target 未提供 message)"
+                info["target_errors"].append(message)
+        elif evt.get("type") in ("agent_message", "assistant") and isinstance(evt.get("text"), str):
+            info["last_message"] = evt["text"]
+    if info["last_message"] is None and last_msg_file is not None:
+        try:
+            text = last_msg_file.read_text(encoding="utf-8").strip()
+            info["last_message"] = text or None
+        except OSError:
+            pass
+    return info
+
+
+def extract_review_verdict(text: str | None) -> str | None:
+    """仅把完整末次答复的最后非空行当机器 verdict(AT-67)。"""
+    if not text:
+        return None
+    verdict_line = re.compile(
+        r"\s*(?:(?:verdict|结论)\s*[:：]\s*)?"
+        r"(?:[*_`#>-]+\s*)?(APPROVED|CHANGES_REQUESTED)"
+        r"(?:\s*[*_`]*)?[.!。]?\s*",
+        re.IGNORECASE,
+    )
+    nonempty_lines = [line for line in text.splitlines() if line.strip()]
+    if not nonempty_lines:
+        return None
+    match = verdict_line.fullmatch(nonempty_lines[-1])
+    return match.group(1).upper() if match else None
+
+
+def describe_session_visibility(env: dict, sessions: dict, session_kind: str,
+                                session_id: str | None) -> dict:
+    """区分 agent 品牌与用户 App shared 对话,并提示专用会话 handback(AT-76/78)。
+
+    AT-78:失败的 resume_shared(未拿到 session_id)既不是 registered_shared,
+    也**不是专用会话**——它没有产出任何可 handback 的专用结果。此前
+    `shared_handoff_required = shared_id and not visible` 把它误判为需交回,
+    并触发"结果来自 dispatcher 专用会话"的虚假 warning。handback 只对**真实
+    产出了专用结果**的 managed_task 有意义。
+    """
+    target_state = sessions.get(env.get("target"), {})
+    shared = normalize_shared_session_entry(target_state.get("shared"))
+    shared_id = shared.get("id") if shared else None
+    visible = bool(shared_id and session_kind == "resume_shared" and
+                   session_id == shared_id)
+    managed_task = session_kind in (
+        "fresh", "fresh_fallback", "fresh_legacy_migration", "resume_task", "fork_project")
+    # 尝试过 shared 但没成为 registered_shared:如实叫 attempted_shared,
+    # 不冒充成功,也不冒充专用会话。
+    attempted_shared = session_kind == "resume_shared" and not visible
+    return {
+        "scope": ("registered_shared" if visible else
+                  "attempted_shared" if attempted_shared else
+                  "managed_task" if managed_task else session_kind),
+        "registered_shared_session_id": shared_id,
+        "visible_in_registered_shared": visible,
+        # 只有真正产出了专用结果才需要 handback;失败的 shared 尝试无结果可交回。
+        "shared_handoff_required": bool(shared_id and managed_task and not visible),
+    }
+
+
+def describe_session_decision(env: dict, sessions: dict, worktree: Path,
+                              session_kind: str) -> dict:
+    """把 shared-first 选择及专用会话例外理由写进机器票据(AT-77)。"""
+    target_state = sessions.get(env.get("target"), {})
+    shared = normalize_shared_session_entry(target_state.get("shared"))
+    compatible = shared_session_compatible(env, shared, worktree)
+    reason = env.get("session_isolation_reason")
+    if session_kind == "resume_shared":
+        reason = None
+    elif not reason:
+        if shared is None:
+            reason = "no_registered_shared_session"
+        elif env.get("mode") == "write" and effective_role(env) != "implementer":
+            reason = "shared_incompatible_role"
+        elif env.get("mode") in ("write", "verify"):
+            reason = "shared_cwd_mismatch"
+        else:
+            reason = "shared_not_compatible"
+    return {
+        "policy": "shared_first",
+        "requested": env.get("session", "auto"),
+        "shared_registered": shared is not None,
+        "shared_compatible": compatible,
+        "selected": session_kind,
+        "dedicated_session_reason": reason,
+    }
+
+
+def clean_event_text(target: str, line: str, routing: dict | None = None,
+                     render_state: dict | None = None,
+                     monotonic_now: float | None = None) -> str:
+    """把 JSONL 事件转换为适合 tail/终端观看的增量文本。"""
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        return ""
+    if target == "claude":
+        if data.get("type") == "system" and data.get("subtype") == "init":
+            requested = (
+                f" profile={routing.get('profile')} requested_effort={routing.get('effort')}"
+                if routing else ""
+            )
+            return (f"[session] model={data.get('model')}{requested} "
+                    f"fast={data.get('fast_mode_state')} cwd={data.get('cwd')}\n")
+        if data.get("type") == "system" and data.get("subtype") == "thinking_tokens":
+            if render_state is None:
+                # 无状态无法做墙钟节流;关闭式不输出,避免新调用点漏传参时刷屏。
+                return ""
+            now = time.monotonic() if monotonic_now is None else monotonic_now
+            previous = render_state.get("thinking_heartbeat_at")
+            if previous is None or now - previous >= THINKING_HEARTBEAT_SECONDS:
+                render_state["thinking_heartbeat_at"] = now
+                return "[thinking] active\n"
+        if data.get("type") == "user":
+            content = (data.get("message") or {}).get("content", [])
+            results = [item for item in content
+                       if isinstance(item, dict) and item.get("type") == "tool_result"]
+            if results:
+                size = sum(len(json.dumps(item.get("content", ""), ensure_ascii=False))
+                           for item in results)
+                return f"[tool-result] count={len(results)} payload_chars={size}\n"
+        if data.get("type") == "stream_event":
+            event = data.get("event", {})
+            if (event.get("type") == "content_block_start" and
+                    event.get("content_block", {}).get("type") == "tool_use"):
+                return f"\n[tool] {event['content_block'].get('name')}\n"
+            delta = event.get("delta", {})
+            if event.get("type") == "content_block_delta" and delta.get("type") == "text_delta":
+                return delta.get("text", "")
+        if data.get("type") == "result":
+            return (f"\n\n[done] turns={data.get('num_turns')} "
+                    f"equivalent_cost_usd={data.get('total_cost_usd')}\n")
+        return ""
+    event_type = data.get("type")
+    if event_type == "thread.started":
+        requested = (
+            f" profile={routing.get('profile')} requested_model={routing.get('model')}"
+            f" requested_effort={routing.get('effort')}"
+            if routing else ""
+        )
+        return f"[session] thread={extract_session_id('codex', data)}{requested}\n"
+    if event_type == "turn.started":
+        if render_state is not None:
+            now = time.monotonic() if monotonic_now is None else monotonic_now
+            render_state["thinking_active"] = True
+            render_state["thinking_heartbeat_at"] = now
+        return "[thinking] active\n"
+    if event_type == "item.started":
+        item = data.get("item", {})
+        if render_state is not None:
+            render_state["thinking_active"] = False
+        return f"\n[tool] {item.get('type', 'item')}\n"
+    if event_type == "item.completed":
+        item = data.get("item", {})
+        if item.get("type") == "agent_message":
+            if render_state is not None:
+                render_state["thinking_active"] = False
+            return item.get("text", "") + "\n"
+        if item.get("type") == "command_execution":
+            output = item.get("aggregated_output", "")
+            if render_state is not None:
+                now = time.monotonic() if monotonic_now is None else monotonic_now
+                render_state["thinking_active"] = True
+                render_state["thinking_heartbeat_at"] = now
+            return (f"[tool-result] type=command_execution status={item.get('status')} "
+                    f"exit={item.get('exit_code')} payload_chars={len(output)}\n"
+                    "[thinking] active\n")
+        if item.get("type") == "error":
+            return f"[warning] {item.get('message', 'codex error item')}\n"
+        return f"[item] {item.get('type', 'completed')}\n"
+    if event_type == "turn.completed":
+        if render_state is not None:
+            render_state["thinking_active"] = False
+        return "\n[done]\n"
+    return ""
+
+
+def run_streaming_process(argv: list[str], cwd: Path, child_env: dict,
+                          stdin_payload: str | None, timeout_s: int,
+                          events_path: Path, transcript_path: Path,
+                          target: str, live_text: bool,
+                          routing: dict | None = None,
+                          on_session_id=None,
+                          on_child_started=None) -> tuple[subprocess.CompletedProcess, bool]:
+    """运行 CLI 并实时双落盘;返回 CompletedProcess 与 timeout 标记。
+
+    AT-25:子进程自成会话/进程组,使超时与外部信号能整组清理(否则 CLI
+    派生的测试进程会活下来);会话 ID 一出现就回调登记,不等收尾。
+    """
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    process = subprocess.Popen(argv, cwd=cwd, env=child_env, text=True,
+                               # Codex 的 prompt 走 argv。若继承 dispatcher stdin,
+                               # 常驻 pipe/socket 会让 codex 等 EOF,且其内容会成为
+                               # 不受信封控制的 <stdin> prompt 旁路(AT-65)。
+                               stdin=(subprocess.PIPE if stdin_payload is not None
+                                      else subprocess.DEVNULL),
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               bufsize=1, start_new_session=True)
+    _ACTIVE_CHILD["process"] = process
+    if _TERMINATION["signal"] is not None:
+        # 信号恰好落在 Popen 与登记之间:立刻补杀,不让子 CLI 跑完整个 timeout。
+        kill_child_group(process, signal.SIGTERM)
+        _ACTIVE_CHILD["escalate_at"] = time.monotonic() + CHILD_TERM_GRACE_S
+    if on_child_started is not None:
+        on_child_started(process.pid)
+    events_file = events_path.open("w", encoding="utf-8")
+    transcript_file = transcript_path.open("w", encoding="utf-8")
+    render_state: dict = {}
+    render_lock = threading.Lock()
+    session_thread: threading.Thread | None = None
+
+    def pump_stdin() -> None:
+        if stdin_payload is None or process.stdin is None:
+            return
+        try:
+            process.stdin.write(stdin_payload)
+        except BrokenPipeError:
+            pass
+        except OSError as exc:
+            stderr_chunks.append(f"dispatch stdin error: {exc}\n")
+        finally:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+
+    def spawn_session_registration(line: str) -> None:
+        """会话 ID 一出现就登记。放独立线程:登记要抢 sessions.lock,不能因此
+        停止抽干 stdout(XB-57 的死锁教训),但必须在本函数返回前 join。"""
+        nonlocal session_thread
+        if on_session_id is None or session_thread is not None:
+            return
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        session_id = extract_session_id(target, data)
+        if not session_id:
+            return
+        session_thread = threading.Thread(target=on_session_id, args=(session_id,),
+                                          daemon=True)
+        session_thread.start()
+
+    def pump_stdout() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            stdout_chunks.append(line)
+            events_file.write(line)
+            events_file.flush()
+            spawn_session_registration(line)
+            clean = clean_event_text(target, line, routing, render_state)
+            if clean:
+                with render_lock:
+                    transcript_file.write(clean)
+                    transcript_file.flush()
+                    if live_text:
+                        sys.stderr.write(clean)
+                        sys.stderr.flush()
+
+    def pump_stderr() -> None:
+        assert process.stderr is not None
+        for line in process.stderr:
+            stderr_chunks.append(line)
+
+    stdout_thread = threading.Thread(target=pump_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=pump_stderr, daemon=True)
+    stdin_thread = threading.Thread(target=pump_stdin, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    stdin_thread.start()
+    timed_out = False
+    deadline = time.monotonic() + timeout_s
+    try:
+        while True:
+            try:
+                process.wait(timeout=CHILD_WAIT_POLL_S)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            now = time.monotonic()
+            if (target == "codex" and render_state.get("thinking_active") and
+                    now - render_state.get("thinking_heartbeat_at", now) >=
+                    THINKING_HEARTBEAT_SECONDS):
+                render_state["thinking_heartbeat_at"] = now
+                with render_lock:
+                    transcript_file.write("[thinking] active\n")
+                    transcript_file.flush()
+                    if live_text:
+                        sys.stderr.write("[thinking] active\n")
+                        sys.stderr.flush()
+            escalate_at = _ACTIVE_CHILD.get("escalate_at")
+            if escalate_at is not None and now >= escalate_at:
+                # 已收到外部信号并给过 SIGTERM 宽限期,子 CLI 仍在:升级整组 SIGKILL,
+                # 保证 dispatcher 一定收敛,不被赖着不走的子进程拖住。
+                _ACTIVE_CHILD["escalate_at"] = None
+                kill_child_group(process, signal.SIGKILL)
+            if now >= deadline:
+                timed_out = True
+                kill_child_group(process, signal.SIGKILL)
+                process.wait()
+                break
+    except KeyboardInterrupt:
+        kill_child_group(process, signal.SIGKILL)
+        process.wait()
+        raise
+    finally:
+        _ACTIVE_CHILD["process"] = None
+        _ACTIVE_CHILD["escalate_at"] = None
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+        stdin_thread.join(timeout=5)
+        if session_thread is not None:
+            # register_session 的锁等待固定上限为 5s;不设 join 超时,确保它绝不
+            # 在主线程写终态之后迟到执行 read-modify-write 覆盖 queue 状态。
+            session_thread.join()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+        events_file.close()
+        transcript_file.close()
+    completed = subprocess.CompletedProcess(argv, process.returncode,
+                                            "".join(stdout_chunks),
+                                            "".join(stderr_chunks))
+    return completed, timed_out
+
+
+def run(envelope_path: str, retry_once: bool = False,
+        live_text: bool = False, queue_on_conflict: bool = False) -> int:
+    started = now_iso()
+    env: dict = {}
+    warnings: list[str] = []
+    queue_manager: DispatchQueue | None = None
+    queue_invocation: str | None = None
+
+    def emit(status: str, extra: dict | None = None, code: int = 1,
+             persist_path: Path | None = None) -> int:
+        # 早期 return 只靠这里收敛 queue;最终 run 主线为让 queue_audit.history
+        # 包含终态会提前更新一次,这里的第二次写是刻意且幂等的(AT-47/87)。
+        if queue_manager is not None and queue_invocation is not None:
+            terminal_state = "done" if status in ("ok", "ok_no_resume") else "failed"
+            queue_manager.update(queue_invocation, terminal_state,
+                                 result_status=status, ended_at=now_iso())
+        result = {"task_id": env.get("task_id", "?"), "status": status,
+                  "started_at": started, "ended_at": now_iso(),
+                  "warnings": warnings}
+        if extra:
+            result.update(extra)
+        if persist_path is not None:
+            try:
+                persist_path.write_text(
+                    json.dumps(result, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+            except OSError as e:
+                # AT-86:业务/审计已经完成时,最终票据落盘失败不得连带摧毁
+                # stdout 机器契约。仍输出同一个 result 对象,并把降级本身机器化。
+                warning = f"最终结果票据落盘失败,stdout 仍保留完整结果:{type(e).__name__}: {e}"
+                warnings.append(warning)
+                result["result_persistence_error"] = {
+                    "type": type(e).__name__,
+                    "message": str(e),
+                    "path": str(persist_path),
+                }
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return code
+
+    if int(os.environ.get("AGENT_CALL_DEPTH", "0")) >= 1:
+        return emit("rejected_depth", code=3)
+    install_termination_handlers()
+
+    try:
+        env.update(json.loads(Path(envelope_path).read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError) as e:
+        return emit("rejected_envelope", {"errors": [str(e)]}, 2)
+    errs = validate_envelope(env)
+    if errs:
+        return emit("rejected_envelope", {"errors": errs}, 2)
+    if queue_on_conflict:
+        queue_config = dict(env.get("queue") or {})
+        queue_config["on_conflict"] = "wait"
+        env["queue"] = queue_config
+    if env.get("target") == "codex":
+        _, catalog_warnings, _ = codex_model_catalog()
+        warnings.extend(catalog_warnings)
+    reasons, warnings_local = gate_check(env)
+    warnings.extend(warnings_local)
+    if reasons:
+        return emit("rejected_gate", {"errors": reasons}, 5)
+
+    worktree = Path(env["worktree"])
+    if REPO_MARKER and not (worktree / REPO_MARKER).is_dir():
+        return emit("rejected_worktree",
+                    {"errors": [f"worktree 下无 {REPO_MARKER}/"
+                                "(由 DISPATCH_REPO_MARKER 指定的项目标记)"]}, 6)
+    if not worktree.is_dir():
+        return emit("rejected_worktree", {"errors": ["worktree 不存在"]}, 6)
+    head_out = git(worktree, "rev-parse", "HEAD")
+    if head_out.returncode != 0:
+        return emit("rejected_worktree", {"errors": ["git rev-parse 失败"]}, 6)
+    head = head_out.stdout.strip()
+    if not head.startswith(env["base_commit"]):
+        return emit("rejected_worktree",
+                    {"errors": [f"HEAD {head[:12]} != base_commit {env['base_commit']}"]}, 6)
+
+    runtime = shared_runtime(worktree)
+    if runtime is None:
+        return emit("rejected_worktree", {"errors": ["无法定位 git common dir"]}, 6)
+    lease = Lease(runtime)
+    conversation_lease = ConversationLease(runtime)
+    quarantine = Quarantine(runtime)
+
+    protected_mode = requires_write_lease(env)
+    q = quarantine.read()
+    if q:
+        if protected_mode:
+            return emit("rejected_quarantine", {"errors": [json.dumps(q, ensure_ascii=False)]}, 7)
+        warnings.append(f"项目处于隔离区(仅拦截 write/verify):{q.get('status')} @ {q.get('at')}")
+
+    if protected_mode:
+        clean = git(worktree, "status", "--porcelain")
+        if clean.returncode != 0 or clean.stdout.strip():
+            return emit("rejected_worktree",
+                        {"errors": ["write/verify 要求干净工作树(XB-42)",
+                                    clean.stdout.strip()[:300]]}, 6)
+
+    invocation = f"{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    out_dir = runtime / "results" / env["task_id"] / invocation
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    owner = invocation
+    try:
+        sessions_before = read_sessions(runtime)
+        argv, session_kind, stdin_payload, execution_cwd = assemble_command(
+            env, sessions_before, out_dir)
+        conv_key = conversation_key(env, sessions_before, session_kind)
+        if session_kind == "fresh_legacy_migration":
+            warnings.append("旧裸字符串会话不受信任;read_only 直接迁移为 fresh 专用会话")
+        if (env.get("session", "auto") == "auto" and
+                env.get("shared_app_idle_confirmed") is True and
+                session_kind != "resume_shared"):
+            warnings.append(
+                "shared-first 未命中:shared 未登记或当前 role/mode 不兼容;"
+                "按 auto 规则使用专用会话")
+    except ValueError as e:
+        return emit("rejected_envelope", {"errors": [str(e)]}, 2)
+
+    queue_manager = DispatchQueue(runtime)
+    queue_invocation = invocation
+    queue_manager.register({
+        "invocation": invocation,
+        "task_id": env["task_id"],
+        "caller": env.get("caller", "unknown"),
+        "target": env["target"],
+        "mode": env["mode"],
+        "session_requested": env.get("session", "auto"),
+        "session_kind": session_kind,
+        "conversation_key": conv_key,
+        "worktree": str(worktree.resolve()),
+        "protected_mode": protected_mode,
+        "pid": os.getpid(),
+        "workflow_phase": (env.get("workflow") or {}).get("phase"),
+    })
+
+    queue_config = env.get("queue") or {}
+    wait_on_conflict = queue_config.get("on_conflict", "reject") == "wait"
+    queue_deadline = time.monotonic() + queue_config.get("timeout_s", 900)
+    queue_poll_s = queue_config.get("poll_ms", 250) / 1000
+    conv_acquired = False
+    lease_acquired = False
+    last_waiting_for: list[str] | None = None
+    last_queue_notice = 0.0
+
+    while True:
+        if _TERMINATION["signal"] is not None:
+            # 排队期间被外部终止:子 CLI 还没起来,工作树没动过,可以干净收敛
+            # 并归还刚取到的资源 —— 不隔离,也不留 orphan 记录。
+            if lease_acquired:
+                lease.release(owner)
+                lease_acquired = False
+            return emit("interrupted", {
+                "errors": [f"dispatcher 在排队等待中收到 {signal_name(_TERMINATION['signal'])}"],
+                "invocation": invocation,
+                "termination_signal": signal_name(_TERMINATION["signal"]),
+                "waiting_for": last_waiting_for or [],
+                "conversation_key": conv_key,
+            }, 1)
+        waiting_for: list[str] = []
+        resource_holders: dict = {}
+        predecessors = queue_manager.predecessors(invocation)
+        if predecessors:
+            waiting_for.extend(f"queue:{r.get('invocation')}" for r in predecessors)
+            resource_holders["queue"] = [
+                {key: record.get(key) for key in
+                 ("invocation", "task_id", "caller", "target", "state")}
+                for record in predecessors
+            ]
+        else:
+            if last_waiting_for is not None:
+                # 前一个 fresh 调用可能在等待期间创建并登记了 task
+                # 会话;出队时重新组装,确保续接而不是再创建一个 fresh 分叉。
+                try:
+                    sessions_before = read_sessions(runtime)
+                    argv, session_kind, stdin_payload, execution_cwd = assemble_command(
+                        env, sessions_before, out_dir)
+                    conv_key = conversation_key(env, sessions_before, session_kind)
+                    queue_manager.update(
+                        invocation, session_kind=session_kind,
+                        conversation_key=conv_key)
+                except ValueError as e:
+                    return emit("rejected_envelope", {"errors": [str(e)]}, 2)
+            # 排队时基线可被前一写任务改变;启动前必须重新关闭式验证。
+            head_now = git(worktree, "rev-parse", "HEAD")
+            if head_now.returncode != 0 or head_now.stdout.strip() != head:
+                return emit("rejected_stale_queue", {
+                    "errors": ["排队期间 HEAD 已变化;请以新 base_commit 重新提交"],
+                    "queued_head": head,
+                    "current_head": head_now.stdout.strip() if head_now.returncode == 0 else None,
+                }, EXIT_STALE_QUEUE)
+            if protected_mode:
+                q_now = quarantine.read()
+                if q_now:
+                    return emit("rejected_quarantine", {
+                        "errors": [json.dumps(q_now, ensure_ascii=False)]}, 7)
+                clean_now = git(worktree, "status", "--porcelain")
+                if clean_now.returncode != 0 or clean_now.stdout.strip():
+                    return emit("rejected_worktree", {
+                        "errors": ["write/verify 在出队前要求干净工作树",
+                                   clean_now.stdout.strip()[:300]]}, 6)
+                lease_conflict = lease.acquire(
+                    env["task_id"], env["target"], str(worktree),
+                    env["base_commit"], owner)
+                if lease_conflict:
+                    waiting_for.append("write_lease")
+                    resource_holders["write_lease"] = resource_holder_details(
+                        lease_conflict, queue_manager)
+                else:
+                    lease_acquired = True
+            if not waiting_for:
+                conversation_conflict = conversation_lease.acquire(
+                    conv_key, owner, env["task_id"], env["target"])
+                if conversation_conflict:
+                    waiting_for.append(f"conversation:{conv_key}")
+                    resource_holders["conversation"] = resource_holder_details(
+                        conversation_conflict, queue_manager)
+                    if lease_acquired:
+                        lease.release(owner)
+                        lease_acquired = False
+                else:
+                    conv_acquired = True
+                    break
+
+        if not wait_on_conflict:
+            status_name = (
+                "rejected_lease" if waiting_for == ["write_lease"] else
+                "rejected_conversation" if any(
+                    item.startswith("conversation:") for item in waiting_for) else
+                "rejected_queue"
+            )
+            return emit(status_name, {
+                "errors": ["目标资源正在被另一调用占用"],
+                "waiting_for": waiting_for,
+                "resource_holders": resource_holders,
+                "conversation_key": conv_key,
+            }, (4 if status_name == "rejected_lease" else
+                8 if status_name == "rejected_conversation" else EXIT_REJECTED_QUEUE))
+        if time.monotonic() >= queue_deadline:
+            return emit("queue_timeout", {
+                "errors": ["排队等待超时"],
+                "waiting_for": waiting_for,
+                "resource_holders": resource_holders,
+                "conversation_key": conv_key,
+            }, EXIT_QUEUE_TIMEOUT)
+
+        if waiting_for != last_waiting_for:
+            queue_manager.update(invocation, "waiting_resource", waiting_for=waiting_for,
+                                 resource_holders=resource_holders)
+        now = time.monotonic()
+        if live_text and (waiting_for != last_waiting_for or now - last_queue_notice >= 10):
+            current = queue_manager.snapshot()["active"]
+            view = next((r for r in current if r.get("invocation") == invocation), {})
+            print(f"[queue] position={view.get('resource_position', '?')} "
+                  f"waiting_for={','.join(waiting_for)}"
+                  f"{' orphaned_holder=true manual_force_release_required' if any(isinstance(v, dict) and v.get('owner_orphaned') for v in resource_holders.values()) else ''}",
+                  file=sys.stderr, flush=True)
+            last_queue_notice = now
+        last_waiting_for = waiting_for
+        time.sleep(queue_poll_s)
+
+    # AT-25:revise 的语义就是"接着上一轮实现会话改";会话没登记(典型原因是
+    # 上一跳 dispatcher 被外部杀死)时开 fresh,会拿不到上一轮上下文却照常返回
+    # 成功——正是 PROTOCOL §4"write 永不自动降级"要防的静默丢历史。关闭式拒绝;
+    # 人工确认确实要重开时,可显式 session=fresh(显式 != 静默)。
+    if ((env.get("workflow") or {}).get("phase") == "revise" and
+            session_kind in ("fresh", "fresh_legacy_migration") and
+            env.get("session", "auto") != "fresh"):
+        if lease_acquired:
+            lease.release(owner)
+        if conv_acquired:
+            conversation_lease.release(conv_key, owner)
+        return emit("rejected_missing_session", {
+            "errors": [
+                f"workflow.phase=revise 要求续接 {env['target']} 的 task 会话,"
+                f"但 task_id={env['task_id']} 未登记会话;不静默降级 fresh。"
+                "常见原因:上一跳 dispatcher 被外部终止。请先用 --status 检查 orphan "
+                "与残留资源;确认要放弃上一轮上下文时显式改用 session=fresh。"],
+            "invocation": invocation,
+            "session_kind": session_kind,
+            "conversation_key": conv_key,
+        }, EXIT_MISSING_SESSION)
+
+    queue_manager.update(invocation, "running", waiting_for=[], started_running_at=now_iso())
+
+    status, proc, attempts = "failed", None, 0
+    parsed = {"session_id": None, "last_message": None}
+    actual_model_observation = None
+    changed, violations = [], []
+    verify_audit = None
+    internal_error = None
+    attempt_paths: list[dict] = []
+    transcript_path = out_dir / "transcript.txt"
+    fallback_used = False
+    try:
+        timeout_s = env.get("budget", {}).get("timeout_s", 900)
+        child_env = dict(os.environ, AGENT_CALL_DEPTH="1")
+        partial = {"stdout": "", "stderr": ""}
+        retries_used = 0
+        while True:
+            attempts += 1
+            try:
+                events_path = out_dir / ("events.jsonl" if attempts == 1
+                                         else f"events-attempt-{attempts}.jsonl")
+                attempt_transcript = transcript_path if attempts == 1 else \
+                    out_dir / f"transcript-attempt-{attempts}.txt"
+                attempt_kind = session_kind
+                attempt_cwd = execution_cwd
+
+                def _register_stream_session(session_id: str,
+                                             _kind=attempt_kind,
+                                             _cwd=attempt_cwd) -> None:
+                    # 先把 ID 落进无锁队列票据,再争 sessions.lock。这样即使
+                    # SIGKILL 恰好发生在会话表写入期间,人工恢复仍能直接看到 ID。
+                    queue_manager.update(
+                        invocation, session_id=session_id,
+                        session_registration="pending",
+                        session_observed_at=now_iso())
+                    registered = register_session(
+                        runtime, env, session_id, _cwd, _kind)
+                    queue_manager.update(
+                        invocation, session_id=session_id,
+                        session_registered_early=registered,
+                        session_registration=("registered" if registered else "failed"),
+                        session_registered_at=now_iso())
+                    if not registered:
+                        warnings.append(
+                            "会话 ID 已从事件流捕获,但 sessions.lock 忙导致早登记失败;"
+                            "正常收尾将重试,若进程被强杀需人工从 queue/events 恢复")
+
+                def _record_child(child_pid: int) -> None:
+                    queue_manager.update(
+                        invocation, child_pid=child_pid,
+                        child_started_at=now_iso())
+
+                proc, timed_out = run_streaming_process(
+                    argv, execution_cwd, child_env, stdin_payload, timeout_s,
+                    events_path, attempt_transcript, env["target"], live_text,
+                    resolve_routing(env),
+                    on_session_id=_register_stream_session,
+                    on_child_started=_record_child)
+                transcript_path = attempt_transcript
+                partial = {"stdout": proc.stdout or "", "stderr": proc.stderr or ""}
+                attempt_stderr = out_dir / ("stderr.log" if attempts == 1
+                                            else f"stderr-attempt-{attempts}.log")
+                attempt_stderr.write_text(partial["stderr"], encoding="utf-8")
+                # AT-81:收尾只 parse 最后一次 attempt 的 stdout,较早 attempt 的
+                # target errors 只剩在原始票据里,机器摘要丢失。此处逐次归纳并带
+                # attempt 序号,使来源可辨;不传 last_msg_file,避免用最终 -o 文件
+                # 污染单次 attempt 的归因。
+                attempt_errors = parse_output(
+                    env["target"], partial["stdout"]).get("target_errors", [])
+                attempt_paths.append({"events": str(events_path),
+                                      "transcript": str(attempt_transcript),
+                                      "stderr": str(attempt_stderr),
+                                      "cwd": str(execution_cwd),
+                                      "exit_code": proc.returncode,
+                                      "attempt": attempts,
+                                      "target_errors": attempt_errors})
+                if _TERMINATION["signal"] is not None:
+                    status = "interrupted"
+                    internal_error = (
+                        f"dispatcher 收到 {signal_name(_TERMINATION['signal'])};"
+                        "子 CLI 进程组已终止")
+                    break
+                if timed_out:
+                    status = "timeout"
+                    break
+                status = "ok" if proc.returncode == 0 else "failed"
+
+                missing_session = (env["target"] == "claude" and
+                                   "No conversation found with session ID" in partial["stderr"])
+                if (status == "failed" and missing_session and
+                        env["mode"] == "read_only" and not fallback_used and
+                        session_kind != "resume_shared"):
+                    fallback_used = True
+                    warnings.append("Claude 旧会话在登记 cwd 不可恢复;read_only 降级 fresh,write 不允许此降级")
+                    if session_kind == "resume_task":
+                        def _drop_task(s, _env=env):
+                            s.get("claude", {}).get("tasks", {}).pop(_env["task_id"], None)
+                        update_sessions(runtime, _drop_task)
+                    fresh_env = dict(env, session="fresh")
+                    fresh_sessions = {"claude": {"tasks": {}}}
+                    argv, _, stdin_payload, execution_cwd = assemble_command(
+                        fresh_env, fresh_sessions, out_dir)
+                    session_kind = "fresh_fallback"
+                    # fallback 有独立尝试槽,不消耗显式 retry-once 配额。
+                    continue
+                if status == "failed" and retry_once and retries_used == 0:
+                    retries_used += 1
+                    continue
+                break
+            except FileNotFoundError as e:
+                internal_error = f"目标 CLI 不存在: {e}"
+                status = "failed"
+                break
+
+        (out_dir / "stderr-final.log").write_text(partial["stderr"], encoding="utf-8")
+        parsed = parse_output(env["target"], partial["stdout"],
+                              out_dir / "last-message.txt" if env["target"] == "codex" else None)
+        # AT-81:warnings 与机器字段必须同源——都用跨 attempt 汇总,
+        # 否则 warning 说的和 target_errors 列的不是同一组事实。
+        all_target_errors = [
+            message
+            for attempt in attempt_paths
+            for message in attempt.get("target_errors", [])
+        ]
+        if env["target"] == "codex":
+            warnings.extend(
+                (f"目标 Codex error 事件:{message}" if len(attempt_paths) <= 1 else
+                 f"目标 Codex error 事件(attempt {attempt['attempt']}):{message}")
+                for attempt in attempt_paths
+                for message in attempt.get("target_errors", []))
+
+        if env["target"] == "codex":
+            if parsed.get("actual_model"):
+                actual_model_observation = {
+                    "status": "observed",
+                    "source": "codex_exec_jsonl",
+                    "model": parsed["actual_model"],
+                    "effort": (parsed.get("usage") or {}).get("reasoning_effort"),
+                    "attribution": "settings metadata emitted in this invocation's exec JSONL",
+                }
+            else:
+                actual_model_observation, observation_warning = observe_codex_rollout(
+                    parsed.get("session_id"), started, now_iso())
+                if observation_warning:
+                    warnings.append(observation_warning)
+
+        if status == "failed" and parsed.get("terminal_reason") == "max_turns":
+            status = "budget_exhausted"
+            warnings.append(
+                "目标 CLI 达到 max_turns;会话已保留。"
+                + ("受保护的 write/verify 仍按失败隔离,须人工核对并 force-release 后再续接;"
+                   "read_only 可直接续接同一 task 获取结论"
+                   if protected_mode else
+                   "read_only 可直接续接同一 task 获取结论"))
+
+        if status == "ok" and not parsed["session_id"]:
+            status = "failed_protocol"  # 退出 0 但无会话 ID,任务无法可靠 resume(XB-43)
+
+        if parsed["session_id"]:
+            if not register_session(runtime, env, parsed["session_id"],
+                                    execution_cwd, session_kind,
+                                    lock_timeout_s=None):
+                if env["mode"] == "write" and status == "ok":
+                    status = "ok_no_resume"  # 工作有效,但下一跳无法 resume(XB-48)
+                warnings.append("会话表锁忙,本次会话 ID 未写回;残留锁用 --force-release 审计清理")
+
+        if env["mode"] == "write":
+            allowed_norm = [normalize_allowed_path(p) for p in env.get("allowed_paths", [])]
+            changed, violations, git_err = audit_paths(worktree, env["base_commit"],
+                                                       [p for p in allowed_norm if p])
+            if git_err:
+                status = "failed_protocol"
+                warnings.append(git_err)
+            elif violations and status in ("ok", "ok_no_resume"):
+                # XB-49:越界必须压过一切"成功"变体,否则绕过 XB-42 的隔离
+                status = "paths_violation"
+            elif status in ("ok", "ok_no_resume"):
+                # AT-20:write 契约要求实现方自己提交。结束时工作树仍脏 =
+                # 契约未完成:成果不持久,且会让下一个任务撞上 clean gate。
+                # 覆盖两种形态:完全没提交,以及提交了但留下残余改动。
+                final = git(worktree, "status", "--porcelain")
+                if final.returncode != 0:
+                    status = "failed_protocol"
+                    warnings.append("收尾 git status 失败,无法确认提交契约")
+                elif final.stdout.strip():
+                    head_now = git(worktree, "rev-parse", "HEAD")
+                    advanced = (head_now.returncode == 0 and
+                                not head_now.stdout.strip().startswith(env["base_commit"]))
+                    status = "uncommitted_work"
+                    warnings.append(
+                        "write 任务结束时工作树仍脏:实现方未完成提交契约"
+                        f"(HEAD {'已前进但有残余改动' if advanced else '未前进,零提交'});"
+                        "租约保留并隔离,避免脏树阻塞下一个任务")
+        elif env["mode"] == "verify":
+            # verify 不接受任何仓库变化。allowed=[] 使 audit_paths 同时覆盖已提交
+            # 与未提交路径;再精确比较本 invocation 的 HEAD,而非仅比较短 base 前缀。
+            changed, violations, git_err = audit_paths(worktree, env["base_commit"], [])
+            head_now = git(worktree, "rev-parse", "HEAD")
+            head_unchanged = head_now.returncode == 0 and head_now.stdout.strip() == head
+            verify_audit = {
+                "changed_paths_empty": not changed,
+                "head_unchanged": head_unchanged,
+            }
+            if git_err:
+                status = "failed_protocol"
+                warnings.append(git_err)
+            elif changed or not head_unchanged:
+                # 以既有 paths_violation 的失败、租约保留、隔离路径收敛。即使
+                # 子进程自身失败,仓库写入仍是更重要的越界事实,不得被掩盖。
+                status = "paths_violation"
+                warnings.append(
+                    "verify 越界:要求 changed_paths==[] 且 HEAD 不前进;"
+                    f"changed_paths={changed}, head_unchanged={head_unchanged}")
+    except KeyboardInterrupt:
+        internal_error = "KeyboardInterrupt: 调用方中断任务"
+        status = "interrupted"
+    except Exception as e:  # noqa: BLE001 —— 统一收敛(XB-45)
+        internal_error = f"{type(e).__name__}: {e}"
+        status = "failed"
+
+    if protected_mode:
+        if status in ("ok", "ok_no_resume"):
+            lease.release(owner)
+        else:
+            # 失败不释放租约:隔离直到人工 --force-release 确认清理(XB-42)
+            quarantine.mark({"task_id": env["task_id"], "invocation": invocation,
+                             "status": status, "worktree": str(worktree),
+                             "violations": violations, "error": internal_error})
+            warnings.append("失败:租约保留,项目进入隔离区,需 --force-release 人工确认")
+
+    if conv_acquired:
+        conversation_lease.release(conv_key, owner)
+
+    head_after = git(worktree, "rev-parse", "HEAD")
+    if env["target"] == "codex" and actual_model_observation is None:
+        reason = "目标进程未产生可用于 rollout 归因的完整结果"
+        actual_model_observation = {
+            "status": "unavailable",
+            "source": "codex_rollout_turn_context",
+            "reason": reason,
+            "sessions_root": str(codex_sessions_root()),
+        }
+        warnings.append(f"Codex actual_model 不可观测:{reason}")
+    actual_model = (
+        actual_model_observation.get("model")
+        if env["target"] == "codex" and
+        actual_model_observation.get("status") == "observed" else
+        (f"unavailable: codex exec JSONL 未暴露且 "
+         f"{actual_model_observation.get('reason')}"
+         if env["target"] == "codex" else parsed.get("actual_model"))
+    )
+    used_shared = session_kind == "resume_shared"
+    capability_env = dict(env, session="shared") if used_shared else env
+    # AT-47/87:必须先写终态再读取 queue_record,否则返回的 queue_audit.history
+    # 看不到本 invocation 的最终 done/failed。emit() 还会幂等重写一次,用于统一
+    # 早期 return 与最终路径,不是遗漏的重复副作用。
+    queue_manager.update(
+        invocation, "done" if status in ("ok", "ok_no_resume") else "failed",
+        result_status=status, ended_at=now_iso())
+    queue_record = queue_manager.read(invocation) if queue_manager else None
+    full_last_message = parsed.get("last_message") or ""
+    visibility = describe_session_visibility(
+        env, sessions_before, session_kind, parsed.get("session_id"))
+    session_decision = describe_session_decision(
+        env, sessions_before, worktree, session_kind)
+    if visibility["shared_handoff_required"]:
+        warnings.append(
+            "本次结果来自 dispatcher 专用会话,不在已登记用户 App shared 对话中;"
+            "上层 orchestrator 应把结果只读 handback 到 registered shared,"
+            "不得把 target agent 品牌等同于该 App 会话")
+    shared_protected_audit = ({
+        "execution_cwd_matches_worktree": (
+            Path(locals().get("execution_cwd", worktree)).resolve() ==
+            worktree.resolve()),
+        "app_idle_confirmed": env.get("shared_app_idle_confirmed") is True,
+        "measurement_scope": (
+            "execution_cwd_matches_worktree restates the pre-launch assembly gate; "
+            "it is not an independent second runtime measurement"
+        ),
+        "app_concurrency_boundary": (
+            "dispatcher locks do not cover the user App; post-run path audit "
+            "detects off-allowlist changes but cannot prevent concurrent writes "
+            "or attribute changes inside allowed_paths"
+        ),
+    } if used_shared and protected_mode else None)
+    extra = {
+        "invocation": invocation,
+        "exit_code": proc.returncode if proc else None,
+        "base_commit": env["base_commit"],
+        "head_commit": head_after.stdout.strip() if head_after.returncode == 0 else None,
+        "changed_paths": changed, "path_violations": violations,
+        "verify_audit": verify_audit,
+        "session_kind": locals().get("session_kind"),
+        "session_id": parsed["session_id"],
+        "session_visibility": visibility,
+        "session_decision": session_decision,
+        "last_message": full_last_message[:2000] or None,
+        "last_message_length": len(full_last_message),
+        "last_message_truncated": len(full_last_message) > 2000,
+        # 失败/超时/预算耗尽不能审批交付;即使截断正文中碰巧有独立
+        # APPROVED 示例行,也必须关闭式返回 null。
+        "verdict": (extract_review_verdict(full_last_message)
+                    if status in ("ok", "ok_no_resume") else None),
+        "events_path": str(out_dir), "transcript_path": str(transcript_path),
+        "attempt_paths": attempt_paths, "retries": max(0, attempts - 1),
+        "fallback_used": fallback_used,
+        "termination_signal": signal_name(_TERMINATION["signal"]),
+        "target_terminal_reason": parsed.get("terminal_reason"),
+        "target_result_subtype": parsed.get("result_subtype"),
+        # AT-81:跨全部 attempt 汇总(单 attempt 时与旧行为逐字相同,契约不变);
+        # 每条的 attempt 来源见 attempt_paths[i].target_errors。
+        # locals().get:异常收敛路径可能在 all_target_errors 赋值前跳出。
+        "target_errors": locals().get("all_target_errors",
+                                      parsed.get("target_errors", [])),
+        # AT-80:列表为空时,靠这里区分"已归纳且无错"与"该 target 不归纳此类事件"。
+        "target_errors_observation": parsed.get("target_errors_observation"),
+        "conversation_key": conv_key,
+        "queue_audit": ({
+            "on_conflict": queue_config.get("on_conflict", "reject"),
+            "waited": any(event.get("state") == "waiting_resource"
+                          for event in (queue_record or {}).get("history", [])),
+            "history": (queue_record or {}).get("history", []),
+        } if queue_record else None),
+        # AT-22/26:锁只覆盖 dispatcher↔dispatcher;App 并发由调用方人工确认,
+        # 该确认必须留痕,便于事后追责——而不是假装被自动保护。
+        "shared_app_idle_confirmed": (env.get("shared_app_idle_confirmed")
+                                      if used_shared else None),
+        # 新字段覆盖 shared verify/write;旧 write 字段保留为兼容别名(AT-83)。
+        "shared_protected_audit": shared_protected_audit,
+        "shared_write_audit": (shared_protected_audit
+                               if used_shared and env.get("mode") == "write" else None),
+        "role": effective_role(env),
+        "workflow": env.get("workflow") or None,
+        "routing": resolve_routing(env),
+        "actual_model": actual_model,
+        "fast_mode": parsed.get("fast_mode") or
+                     ("unsupported: codex exec help exposes no --fast flag"
+                      if env["target"] == "codex" else None),
+        "service_tier": parsed.get("service_tier") or
+                        (CODEX_UNAVAILABLE if env["target"] == "codex" else None),
+        "speed": parsed.get("speed") or
+                 (CODEX_UNAVAILABLE if env["target"] == "codex" else None),
+        "usage": parsed.get("usage") or
+                 (CODEX_UNAVAILABLE if env["target"] == "codex" else None),
+        "equivalent_cost_usd": parsed.get("equivalent_cost_usd") if
+                               parsed.get("equivalent_cost_usd") is not None else
+                               (CODEX_UNAVAILABLE if env["target"] == "codex" else None),
+        "gate_capability": capabilities(capability_env),
+    }
+    if env["target"] == "codex":
+        observed_effort = (actual_model_observation or {}).get("effort")
+        if isinstance(observed_effort, str) and observed_effort:
+            extra["actual_effort"] = observed_effort
+        elif ((actual_model_observation or {}).get("status") == "observed"):
+            extra["actual_effort"] = "unavailable: observed settings omitted reasoning effort"
+        else:
+            extra["actual_effort"] = (
+                f"unavailable: {(actual_model_observation or {}).get('reason', '无可用观测')}")
+        extra["actual_model_observation"] = actual_model_observation
+    if internal_error:
+        extra["error"] = internal_error
+    result_code = (0 if status in ("ok", "ok_no_resume") else
+                   EXIT_BUDGET_EXHAUSTED if status == "budget_exhausted" else 1)
+    # AT-64/85:stdout 与落盘必须来自同一个最终 result 对象,避免 task_id、时间戳、
+    # warnings 或未来新增顶层字段发生漂移。
+    return emit(status, extra, result_code,
+                persist_path=out_dir / "result-envelope.json")
+
+
+def print_preflight(envelope_path: Path) -> int:
+    """AT-89:只读预检运行时前提;不登记、不取锁、不创建 runtime。
+
+    结果只是调用前快照。App、其他 dispatcher 或用户可在返回后立刻改变状态,
+    所以真正 run 仍须重新执行全部关闭式闸门,不得把 ready 当成授权或保证。
+    """
+    snapshot_at = now_iso()
+    warnings: list[str] = []
+    errors: list[str] = []
+    waiting_for: list[str] = []
+    checks: dict = {}
+    boundary = (
+        "snapshot only: no lease or state is reserved; App/user/other dispatchers may change "
+        "HEAD, worktree, sessions, queue or locks immediately after this result. The real run "
+        "rechecks every fail-closed gate and is the authoritative decision"
+    )
+
+    def output(status: str, code: int, env: dict | None = None) -> int:
+        payload = {
+            "status": status,
+            "ready": status == "ready",
+            "snapshot_at": snapshot_at,
+            "task_id": (env or {}).get("task_id", "?"),
+            "errors": errors,
+            "warnings": warnings,
+            "waiting_for": waiting_for,
+            "checks": checks,
+            "toctou_boundary": boundary,
+            "side_effects": "none: report only; no runtime creation, queue registration, lock acquisition or release",
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return code
+
+    try:
+        env = json.loads(envelope_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"信封读取失败:{type(exc).__name__}: {exc}")
+        checks["envelope"] = {"ok": False}
+        return output("invalid_envelope", 2)
+    if not isinstance(env, dict):
+        errors.append("信封顶层必须是 JSON 对象")
+        checks["envelope"] = {"ok": False}
+        return output("invalid_envelope", 2)
+
+    schema_errors = validate_envelope(env)
+    checks["envelope"] = {"ok": not schema_errors, "errors": schema_errors}
+    if schema_errors:
+        errors.extend(schema_errors)
+        return output("invalid_envelope", 2, env)
+    gate_errors, gate_warnings = gate_check(env)
+    warnings.extend(gate_warnings)
+    if env.get("target") == "codex":
+        _, catalog_warnings, _ = codex_model_catalog()
+        warnings.extend(catalog_warnings)
+    if gate_errors:
+        checks["envelope"]["ok"] = False
+        checks["envelope"]["errors"].extend(gate_errors)
+        errors.extend(gate_errors)
+        return output("invalid_envelope", 2, env)
+
+    worktree = Path(env["worktree"])
+    if not worktree.is_dir():
+        errors.append("worktree 不存在")
+        checks["worktree"] = {"ok": False, "path": str(worktree)}
+        return output("blocked", 1, env)
+    marker_ok = not REPO_MARKER or (worktree / REPO_MARKER).is_dir()
+    checks["worktree"] = {
+        "ok": marker_ok,
+        "path": str(worktree.resolve()),
+        "repo_marker": REPO_MARKER or None,
+    }
+    if not marker_ok:
+        errors.append(f"worktree 下无 {REPO_MARKER}/(项目标记)")
+
+    head_out = git_readonly(worktree, "rev-parse", "HEAD")
+    current_head = head_out.stdout.strip() if head_out.returncode == 0 else None
+    head_matches = bool(current_head and current_head.startswith(env["base_commit"]))
+    checks["head"] = {
+        "ok": head_matches,
+        "base_commit": env["base_commit"],
+        "current_head": current_head,
+    }
+    if head_out.returncode != 0:
+        errors.append("git rev-parse HEAD 失败")
+    elif not head_matches:
+        errors.append(f"HEAD {current_head[:12]} != base_commit {env['base_commit']}")
+
+    protected_mode = requires_write_lease(env)
+    if protected_mode:
+        clean_out = git_readonly(worktree, "status", "--porcelain")
+        clean = clean_out.returncode == 0 and not clean_out.stdout.strip()
+        checks["clean_worktree"] = {
+            "required": True,
+            "ok": clean,
+            "changes": clean_out.stdout.strip()[:300] or None,
+        }
+        if clean_out.returncode != 0:
+            errors.append("git status --porcelain 失败")
+        elif not clean:
+            errors.append("write/verify 要求干净工作树")
+    else:
+        checks["clean_worktree"] = {"required": False, "ok": True}
+
+    runtime = shared_runtime(worktree, create=False)
+    if runtime is None:
+        errors.append("无法定位 git common dir")
+        checks["runtime"] = {"ok": False}
+        return output("blocked", 1, env)
+    checks["runtime"] = {
+        "ok": True,
+        "path": str(runtime),
+        "exists": runtime.is_dir(),
+        "created_by_preflight": False,
+    }
+    sessions = read_sessions(runtime)
+    queue = DispatchQueue(runtime, create=False)
+    lease = Lease(runtime)
+    conversation_lease = ConversationLease(runtime, create=False)
+    quarantine = Quarantine(runtime)
+    shared_entry = (
+        normalize_shared_session_entry(sessions.get(env["target"], {}).get("shared"))
+        if isinstance(sessions, dict) else None
+    )
+    shared_compatible = shared_session_compatible(env, shared_entry, worktree)
+    checks["shared_session"] = {
+        "requested": env.get("session", "auto"),
+        "registered": shared_entry is not None,
+        "compatible": shared_compatible,
+        "registered_id": shared_entry.get("id") if shared_entry else None,
+        "registered_cwd": shared_entry.get("cwd") if shared_entry else None,
+        "mode": env["mode"],
+        "role": effective_role(env),
+        "app_idle_confirmation_present": env.get("shared_app_idle_confirmed") is True,
+    }
+
+    quarantine_record = quarantine.read()
+    quarantine_blocks = protected_mode and quarantine_record is not None
+    checks["quarantine"] = {
+        "ok": not quarantine_blocks,
+        "blocks_this_mode": quarantine_blocks,
+        "record": quarantine_record,
+    }
+    if quarantine_blocks:
+        errors.append("项目处于隔离区,会拒绝 write/verify")
+    elif quarantine_record is not None:
+        warnings.append("项目处于隔离区,但当前 read_only 不被拦截")
+
+    lease_lock_exists = lease.lock.exists()
+    lease_record = lease.read() if lease_lock_exists else None
+    checks["write_lease"] = {
+        "required": protected_mode,
+        "ok": not (protected_mode and lease_lock_exists),
+        "occupied": lease_lock_exists,
+        "record": lease_record or ({"corrupt_or_unreadable": True}
+                                   if lease_lock_exists else None),
+    }
+    if protected_mode and lease_lock_exists:
+        waiting_for.append("write_lease")
+
+    session_kind = None
+    conv_key = None
+    try:
+        _, session_kind, _, execution_cwd = assemble_command(
+            env, sessions, runtime / "preflight-no-write")
+        conv_key = conversation_key(env, sessions, session_kind)
+        session_decision = describe_session_decision(
+            env, sessions, worktree, session_kind)
+        checks["session"] = {
+            "ok": True,
+            "session_kind": session_kind,
+            "execution_cwd": str(execution_cwd),
+            "conversation_key": conv_key,
+            "session_decision": session_decision,
+        }
+        # AT-94:run() 对 revise 的缺会话关闭式拒绝不能等到登记队列/取租约后
+        # 才暴露。preflight 必须用同一 session_kind 预览把这个必然拒绝提前报告;
+        # 显式 session=fresh 仍表示操作者已确认放弃旧上下文,因此允许。
+        if ((env.get("workflow") or {}).get("phase") == "revise" and
+                session_kind in ("fresh", "fresh_legacy_migration") and
+                env.get("session", "auto") != "fresh"):
+            message = (
+                f"workflow.phase=revise 要求续接 {env['target']} 的 task 会话,"
+                f"但 task_id={env['task_id']} 未登记会话;正式 run 会以 "
+                "rejected_missing_session 关闭式拒绝。确认放弃旧上下文时请显式使用 "
+                "session=fresh。")
+            checks["session"]["ok"] = False
+            checks["session"]["error"] = message
+            errors.append(message)
+    except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
+        checks["session"] = {"ok": False, "error": str(exc)}
+        errors.append(f"session 前提不满足:{exc}")
+
+    active_conflicts = []
+    if conv_key is not None:
+        proposed = {"conversation_key": conv_key, "protected_mode": protected_mode}
+        active_conflicts = [
+            {key: record.get(key) for key in
+             ("invocation", "task_id", "caller", "target", "state",
+              "conversation_key", "protected_mode")}
+            for record in queue.snapshot()["active"]
+            if DispatchQueue.conflicts(proposed, record)
+        ]
+        waiting_for.extend(
+            f"queue:{record.get('invocation')}" for record in active_conflicts)
+
+        conversation_path = conversation_lease._path(conv_key)
+        conversation_record = None
+        if conversation_path.exists():
+            try:
+                conversation_record = json.loads(
+                    conversation_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                conversation_record = {"corrupt_or_unreadable": True,
+                                       "path": str(conversation_path)}
+            waiting_for.append(f"conversation:{conv_key}")
+        checks["conversation_lease"] = {
+            "ok": conversation_record is None,
+            "key": conv_key,
+            "occupied": conversation_record is not None,
+            "record": conversation_record,
+        }
+    else:
+        checks["conversation_lease"] = {
+            "ok": False,
+            "key": None,
+            "occupied": None,
+            "record": None,
+        }
+    checks["queue"] = {
+        "ok": not active_conflicts,
+        "conflicting_active": active_conflicts,
+        "position_is_reserved": False,
+    }
+
+    # 去重但保留资源发现顺序,使机器票据稳定。
+    waiting_for[:] = list(dict.fromkeys(waiting_for))
+    if errors:
+        return output("blocked", 1, env)
+    if waiting_for:
+        if (env.get("queue") or {}).get("on_conflict", "reject") == "wait":
+            warnings.append("资源当前忙;正式 run 会排队,但 preflight 不占队位也不保证最终可启动")
+            return output("would_wait", 1, env)
+        errors.append("目标资源当前被占用;queue.on_conflict=reject 会立即拒绝")
+        return output("blocked", 1, env)
+    return output("ready", 0, env)
+
+
+def print_status(worktree: Path) -> int:
+    """AT-35:只读快照;不发起调用,因此 depth=1 的被调 agent 也可查。"""
+    if not worktree.is_dir():
+        print(json.dumps({"status": "rejected_worktree",
+                          "errors": ["worktree 不存在"]}, ensure_ascii=False))
+        return 6
+    runtime = shared_runtime(worktree, create=False)
+    if runtime is None:
+        print(json.dumps({"status": "rejected_worktree",
+                          "errors": ["无法定位 git common dir"]}, ensure_ascii=False))
+        return 6
+    queue = DispatchQueue(runtime, create=False)
+    lease = Lease(runtime)
+    conversation_lease = ConversationLease(runtime, create=False)
+    quarantine = Quarantine(runtime)
+    queue_snapshot = queue.snapshot()
+    orphaned_ids = {item.get("invocation") for item in queue_snapshot["orphaned"]}
+    queue_snapshot["orphan_details"] = queue.orphan_details(probe_children=True)
+
+    def annotate_holder(record: dict | None) -> dict | None:
+        if record is None:
+            return None
+        annotated = dict(record)
+        orphaned = annotated.get("owner") in orphaned_ids
+        annotated["owner_orphaned"] = orphaned
+        if orphaned:
+            annotated["action"] = "manual --force-release required"
+        return annotated
+
+    payload = {
+        "status": "ok",
+        "worktree": str(worktree.resolve()),
+        "queue": queue_snapshot,
+        "resources": {
+            "write_lease": annotate_holder(lease.read()),
+            "conversation_leases": [annotate_holder(record)
+                                    for _, record in conversation_lease.records()],
+            "quarantine": quarantine.read(),
+            "app_activity": (
+                "unobservable: Claude/Codex App do not participate in dispatcher locks; "
+                "shared calls still require explicit human idle confirmation"
+            ),
+            "orphan_diagnostics_boundary": (
+                "child CLI protection begins after child_pid is persisted; a SIGKILL in the "
+                "Popen-to-queue-update window can leave an unreported child. A reported child "
+                "uses pid liveness and may false-positive after pid reuse; force-release stays "
+                "closed unless the operator supplies the exact --override-live-child-pid."
+            ),
+        },
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def main() -> int:
+    # AT-35:状态查询是唯一的 depth=1 例外;它不执行/修改/解锁任务。
+    args = sys.argv[1:]
+    if args and args[0] == "--status":
+        if len(args) != 2:
+            print("用法:--status <worktree>", file=sys.stderr)
+            return 2
+        return print_status(Path(args[1]))
+    # XB-47:depth guard 覆盖其他所有执行/管理子命令,尤其是 --force-release。
+    if int(os.environ.get("AGENT_CALL_DEPTH", "0")) >= 1:
+        print(json.dumps({"status": "rejected_depth",
+                          "errors": ["AGENT_CALL_DEPTH>=1:被调 agent 不得使用 dispatcher 任何子命令"]},
+                         ensure_ascii=False))
+        return 3
+    if not args:
+        print(__doc__)
+        return 2
+    if args[0] == "--preflight":
+        if len(args) != 2:
+            print("用法:--preflight <envelope.json>", file=sys.stderr)
+            return 2
+        return print_preflight(Path(args[1]))
+    if args[0] == "--validate-only":
+        env = json.loads(Path(args[1]).read_text(encoding="utf-8"))
+        reasons, warns = gate_check(env)
+        if env.get("target") == "codex":
+            _, catalog_warnings, _ = codex_model_catalog()
+            warns.extend(catalog_warnings)
+        errs = validate_envelope(env) + reasons
+        print(json.dumps({"valid": not errs, "errors": errs, "warnings": warns},
+                         ensure_ascii=False, indent=2))
+        return 0 if not errs else 2
+    if args[0] == "--register-shared":
+        # AT-63:shared 首次登记的受审计入口。此前 shared 只在 resume 成功后写回,
+        # 于是"要先有已登记会话才能登记会话"——skill 只能要求用户手改 sessions.json
+        # 或内置本机 ID,两者都不可分享。本命令把 id/cwd 作为参数显式传入,
+        # 不硬编码任何本机值;depth guard 照常覆盖(登记是状态变更,被调 agent 不得自登记)。
+        if len(args) != 5:
+            print("用法:--register-shared <worktree> <codex|claude> <session_id> <cwd>",
+                  file=sys.stderr)
+            return 2
+        worktree, target, session_id, raw_cwd = (
+            Path(args[1]), args[2], args[3], args[4])
+        errors = []
+        if target not in ("codex", "claude"):
+            errors.append("target 必须是 codex 或 claude")
+        if not SHARED_SESSION_ID_RE.fullmatch(session_id):
+            errors.append("session_id 必须是 8..128 位字母/数字/连字符")
+        session_cwd = Path(raw_cwd)
+        if not session_cwd.is_absolute():
+            errors.append("cwd 必须是绝对路径")
+        elif not session_cwd.is_dir():
+            errors.append(f"cwd 不存在或不是目录:{session_cwd}")
+        if errors:
+            print(json.dumps({"registered": False, "errors": errors},
+                             ensure_ascii=False, indent=2))
+            return 2
+        # 先只读定位 runtime;存在性证明失败时不得为了一个被拒登记创建任何状态。
+        runtime = shared_runtime(worktree, create=False)
+        if runtime is None:
+            print(json.dumps({"registered": False,
+                              "errors": ["无法定位 git common dir"]}, ensure_ascii=False))
+            return 6
+        entry = {"id": session_id, "cwd": str(session_cwd.resolve()),
+                 "user_linked": True, "registered_at": now_iso()}
+        if normalize_shared_session_entry(entry) is None:
+            print(json.dumps({"registered": False,
+                              "errors": ["登记项未通过 normalize_shared_session_entry"]},
+                             ensure_ascii=False))
+            return 2
+        evidence = shared_session_evidence(target, session_id, session_cwd)
+        if evidence.get("status") != "verified":
+            # AT-63 第二段裁决:两侧已有可靠本地 id+cwd 元数据,故关闭式拒绝。
+            # 客户端路径/schema 变化也必须显式失败,不能把错误推迟到昂贵的 resume。
+            print(json.dumps({
+                "registered": False,
+                "target": target,
+                "evidence": evidence,
+                "errors": [f"无法证明该 {target} shared 会话真实存在且 cwd 一致:"
+                           f"{evidence.get('reason')}"],
+                "warnings": [],
+            }, ensure_ascii=False, indent=2))
+            return 5
+        runtime.mkdir(parents=True, exist_ok=True)
+        warnings = []
+        previous = read_sessions(runtime).get(target, {}).get("shared")
+        audit = runtime / "sessions-audit.log"
+        # AT-91:sessions.json 与 sessions-audit.log 是两个文件,**无法真正原子**。
+        # 此前顺序是"先改状态、再写审计",审计失败即裸 traceback,留下
+        # "新 id 已生效、审计只有旧记录"的静默半成功。这里不假装原子,而是:
+        #   1) 先关闭式确认审计可写——不可写就拒绝登记,状态一动不动(常见情形);
+        #   2) 再改状态;
+        #   3) 再写审计;若在 1 与 3 之间被人改成只读(窄竞态),状态已变无法回滚,
+        #      则如实报告 audit_written=false 并以非零退出,绝不静默成功。
+        try:
+            with audit.open("a", encoding="utf-8"):
+                pass
+        except OSError as exc:
+            print(json.dumps({
+                "registered": False,
+                "errors": [f"审计不可写,拒绝登记(状态未改动):{type(exc).__name__}: {exc}"],
+                "audit_log": str(audit),
+                "atomicity": "sessions.json 与 sessions-audit.log 非原子;"
+                             "故审计不可写时关闭式拒绝,不产生无痕状态变更",
+            }, ensure_ascii=False, indent=2))
+            return 4
+        def _mut(sessions, _t=target, _e=entry, _ev=evidence):
+            sessions.setdefault(_t, {})["shared"] = {**_e, "evidence": _ev}
+        if update_sessions(runtime, _mut) is None:
+            print(json.dumps({"registered": False,
+                              "errors": ["sessions.lock 忙,未写入;残留锁用 --force-release 清理"]},
+                             ensure_ascii=False))
+            return 4
+        record = {"at": now_iso(), "action": "register-shared",
+                  "target": target, "previous": previous,
+                  "current": {**entry, "evidence": evidence}}
+        audit_written, audit_error = True, None
+        try:
+            with audit.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            # 状态已写入且无法回滚(回滚本身也需要审计,会递归到同一问题)。
+            # 唯一诚实的做法:完整机器结果 + 非零退出,让调用方知道该补审计。
+            audit_written, audit_error = False, f"{type(exc).__name__}: {exc}"
+            warnings.append(
+                f"审计写入失败但登记已生效:{audit_error}。"
+                "状态已变更而审计无痕,请人工补记或核对 sessions.json 后重登记")
+        result = {
+            "registered": True, "target": target, "entry": entry,
+            "evidence": evidence,
+            # 覆盖不静默:旧登记原样回显并已进审计,便于人核对是否误覆盖。
+            "replaced_previous": previous,
+            "warnings": warnings,
+            "audit_log": str(audit),
+            "audit_written": audit_written,
+            "audit_error": audit_error,
+            "atomicity": "sessions.json 与 sessions-audit.log 非原子;"
+                         "审计先做可写性关闭式预检,仍失败则报 audit_written=false",
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if audit_written else 4
+    if args[0] == "--force-release":
+        if len(args) < 4:
+            print("用法:--force-release <worktree> <确认值> <原因...> "
+                  "[--override-live-child-pid=<pid>]", file=sys.stderr)
+            return 2
+        worktree, confirm = Path(args[1]), args[2]
+        override_args = [arg for arg in args[3:]
+                         if arg.startswith("--override-live-child-pid=")]
+        if len(override_args) > 1:
+            print("最多提供一个 --override-live-child-pid", file=sys.stderr)
+            return 2
+        override_child_pid = None
+        if override_args:
+            try:
+                override_child_pid = int(override_args[0].split("=", 1)[1])
+            except ValueError:
+                print("--override-live-child-pid 必须是正整数", file=sys.stderr)
+                return 2
+            if override_child_pid <= 0:
+                print("--override-live-child-pid 必须是正整数", file=sys.stderr)
+                return 2
+        reason = " ".join(arg for arg in args[3:]
+                          if not arg.startswith("--override-live-child-pid=")).strip()
+        if not reason:
+            print("必须提供非空原因", file=sys.stderr)
+            return 2
+        runtime = shared_runtime(worktree)
+        if runtime is None:
+            print("无法定位 git common dir", file=sys.stderr)
+            return 6
+        lease = Lease(runtime)
+        conversation_lease = ConversationLease(runtime)
+        queue = DispatchQueue(runtime)
+        quarantine = Quarantine(runtime)
+        cur, q = lease.read(), quarantine.read()
+        conversation_records = conversation_lease.records()
+        orphaned_records = queue.snapshot()["orphaned"]
+        expected = {v for rec in (cur, q) if rec
+                    for v in (rec.get("task_id"), rec.get("owner"), rec.get("invocation")) if v}
+        expected.update(v for _, rec in conversation_records
+                        for v in (rec.get("task_id"), rec.get("owner"), rec.get("key")) if v)
+        expected.update(v for rec in orphaned_records
+                        for v in (rec.get("task_id"), rec.get("invocation"),
+                                  rec.get("conversation_key")) if v)
+        if expected and confirm not in expected:
+            print(json.dumps({"forced": False,
+                              "errors": [f"确认值不匹配;当前记录 task_id={ (cur or q or {}).get('task_id') }"]},
+                             ensure_ascii=False))
+            return 5
+        matching_live_children = []
+        for detail in queue.orphan_details(probe_children=True):
+            expected_detail = {detail.get("task_id"), detail.get("invocation"),
+                               detail.get("conversation_key")}
+            child = (detail.get("holds") or {}).get("child_cli")
+            if confirm in expected_detail and isinstance(child, dict) and child.get("alive") is True:
+                matching_live_children.append(child)
+        unoverridden_children = [
+            child for child in matching_live_children
+            if child.get("pid") != override_child_pid
+        ]
+        if unoverridden_children:
+            print(json.dumps({
+                "forced": False,
+                "errors": [
+                    "匹配的 orphan 仍有子 CLI 在运行;先人工终止该进程,或在确认 pid "
+                    "已复用/风险可接受后提供精确 --override-live-child-pid"],
+                "live_children": unoverridden_children,
+            }, ensure_ascii=False))
+            return 5
+        if override_child_pid is not None and not matching_live_children:
+            print(json.dumps({
+                "forced": False,
+                "errors": ["override pid 与当前匹配 orphan 的活 child_pid 不一致"]
+            }, ensure_ascii=False))
+            return 5
+        if override_child_pid is not None:
+            reason += f" [operator override live/reused child_pid={override_child_pid}]"
+        sessions_lock = runtime / "sessions.lock"
+        if not expected and not sessions_lock.exists():
+            print(json.dumps({"forced": False, "nothing_to_clear": True}, ensure_ascii=False))
+            return 0
+        global_expected = {v for rec in (cur, q) if rec
+                           for v in (rec.get("task_id"), rec.get("owner"), rec.get("invocation")) if v}
+        if confirm in global_expected:
+            lease.force_release(reason)
+            quarantine.clear(lease.audit, reason)
+        conversation_lease.force_release_matching(confirm, reason)
+        queue_release = queue.force_release_matching(confirm, reason)
+        if sessions_lock.exists():  # XB-48:残留会话锁一并审计清理
+            with lease.audit.open("a", encoding="utf-8") as f:
+                stale = sessions_lock.read_text(encoding="utf-8", errors="replace")
+                f.write(json.dumps({"at": now_iso(), "action": "clear-sessions-lock",
+                                    "previous": stale[:200], "reason": reason},
+                                   ensure_ascii=False) + "\n")
+            sessions_lock.unlink(missing_ok=True)
+        print(json.dumps({"forced": True, "reason": reason,
+                          "queue_records_released": queue_release["retained"],
+                          "queue_records_matched": queue_release["matched"],
+                          "queue_records_marked": queue_release["marked"],
+                          "queue_records_pruned": queue_release["pruned"],
+                          "overrode_live_child_pid": override_child_pid},
+                         ensure_ascii=False))
+        return 0
+    retry = "--retry-once" in args
+    live_text = "--live-text" in args
+    queue_on_conflict = "--queue" in args
+    envelope_args = [arg for arg in args
+                     if arg not in ("--retry-once", "--live-text", "--queue")]
+    if len(envelope_args) != 1:
+        print("用法:dispatch-agent <envelope.json> [--retry-once] [--live-text] [--queue]",
+              file=sys.stderr)
+        return 2
+    return run(envelope_args[0], retry_once=retry, live_text=live_text,
+               queue_on_conflict=queue_on_conflict)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

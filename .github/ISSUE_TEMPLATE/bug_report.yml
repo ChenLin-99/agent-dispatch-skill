@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a reproducible installation, dispatch, session, queue, or result problem
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Remove credentials, private prompts, and sensitive paths before submitting.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Commit SHA from this repository and your Codex/Claude CLI versions.
+      placeholder: commit SHA; codex --version; claude --version
+    validations:
+      required: true
+  - type: dropdown
+    id: direction
+    attributes:
+      label: Call direction
+      options:
+        - Codex to Claude
+        - Claude to Codex
+        - Installation only
+    validations:
+      required: true
+  - type: input
+    id: mode
+    attributes:
+      label: Mode and session
+      description: For example write + auto, verify + shared, or read_only + task.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the machine status, warnings, and exit code when available.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Redact secrets and private prompt content from envelopes and logs.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed tokens, credentials, private prompts, and sensitive paths.
+          required: true

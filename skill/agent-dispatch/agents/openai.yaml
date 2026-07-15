@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Dispatch"
+  short_description: "Coordinate Codex and Claude with audited handoffs"
+  default_prompt: "Use $agent-dispatch to coordinate this task between Codex and Claude with audited shared-session handoffs."
